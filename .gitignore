@@ -1,0 +1,8 @@
+# Dati personali e locali: NON vanno su GitHub
+valocheck_dati/
+henrik_key.txt
+cartella_condivisa.txt
+parametri.json
+.env
+__pycache__/
+*.pyc
