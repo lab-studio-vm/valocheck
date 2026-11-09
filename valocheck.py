@@ -66,7 +66,7 @@ from datetime import datetime, timezone
 from itertools import combinations
 from typing import Dict, List, Optional, Tuple
 
-VERSIONE = "0.2.0"
+VERSIONE = "0.2.1"
 
 if sys.platform == "win32":
     try:
@@ -1436,12 +1436,12 @@ def sincronizza(db: Database, stampa=print) -> bool:
         return False
     try:
         n_file, n_rimb = importa_condivisi(db, cartella)
-        miei = esporta_condivisi(db, cartella)
-        totale = db.esegui("SELECT COUNT(*) FROM rimborsi")[0][0]
+        esporta_condivisi(db, cartella)
+        totale = db.esegui("SELECT COUNT(*) FROM (SELECT DISTINCT puuid, match_id FROM rimborsi)")[0][0]
         STATO_CONDIVISIONE.update(ultima=time.time(), testo=(
             f"attiva ({n_file} altri partecipanti, rimborsi in totale: {totale})"))
-        stampa(f"[condivisione] letti {n_file} file di altri (+{n_rimb} rimborsi nuovi), "
-               f"scritti i tuoi dati ({miei} rimborsi).")
+        stampa(f"[condivisione] letti {n_file} file di altri, scritti i tuoi dati. "
+               f"Rimborsi distinti in totale: {totale}.")
         return True
     except Exception as e:  # noqa: BLE001
         STATO_CONDIVISIONE["testo"] = f"errore: {e}"
@@ -1881,7 +1881,15 @@ def fase0b():
 def triangola(api, db: Database, stampa=print) -> List[Tuple[str, float, int]]:
     punteggio: Dict[str, float] = {}
     partite: Dict[str, set] = {}
-    for puuid, cand_json in db.esegui("SELECT puuid, partite_candidate FROM rimborsi"):
+    visti = set()
+    # Lo stesso rimborso puo' essere salvato da piu' fonti (Riot, Henrik, altri
+    # partecipanti): va contato UNA volta sola.  Preferisco la fonte Riot.
+    for puuid, mid_rimb, cand_json in db.esegui(
+            "SELECT puuid, match_id, partite_candidate FROM rimborsi "
+            "ORDER BY CASE fonte WHEN 'riot' THEN 0 ELSE 1 END"):
+        if (puuid, mid_rimb) in visti:
+            continue
+        visti.add((puuid, mid_rimb))
         for mid, peso in json.loads(cand_json or "[]"):
             squadra = db.squadre_di(mid)
             if puuid not in squadra and api is not None:
@@ -1939,7 +1947,7 @@ def fase1():
                 print(f"   [{i}/{len(tutti)}]")
     except KeyboardInterrupt:
         print("\nInterrotto.")
-    n_r = db.esegui("SELECT COUNT(*) FROM rimborsi")[0][0]
+    n_r = db.esegui("SELECT COUNT(*) FROM (SELECT DISTINCT puuid, match_id FROM rimborsi)")[0][0]
     righe.append(f"Rimborsi nel database: {n_r}")
     classifica = triangola(api, db)
     righe.append("\nCandidati (punteggio = partite rimborsate in cui era avversario, pesate):")
