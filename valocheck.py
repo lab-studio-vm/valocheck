@@ -66,7 +66,7 @@ from datetime import datetime, timezone
 from itertools import combinations
 from typing import Dict, List, Optional, Tuple
 
-VERSIONE = "0.2.1"
+VERSIONE = "0.2.2"
 
 if sys.platform == "win32":
     try:
@@ -102,12 +102,19 @@ PARAMETRI_DEFAULT = {
     "partite_da_analizzare": 6,
     "code_ammesse": ["competitive", "premier", "unrated"],
     "fattore_correlazione_segnali": 0.6,
+    "_nota_cap_negativo": ("Massimo 'sconto' che un segnale nella norma puo' dare. Senza questo limite "
+                           "un giocatore normale finisce sempre a 0.0%, cioe' certezza che non abbiamo."),
+    "cap_negativo": 1.0,
     "peso_profilo_account": 0.7,
     "segnali": {
         "hs":    {"nome": "Headshot %",              "mu": 1.5, "sigma": 1.2, "cap": 3.0, "minimo_scala": 0.03},
         "adr":   {"nome": "ADR",                     "mu": 1.0, "sigma": 1.2, "cap": 2.0, "minimo_scala": 10.0},
         "fk":    {"nome": "Primi duelli vinti",      "mu": 1.0, "sigma": 1.2, "cap": 2.0, "minimo_scala": 0.08},
-        "ang":   {"nome": "Precisione angolare",     "mu": 1.8, "sigma": 1.2, "cap": 3.0, "minimo_scala": 1.5},
+        "ang":   {"nome": "Precisione angolare",     "mu": 1.8, "sigma": 1.2, "cap": 3.0, "minimo_scala": 1.5,
+                  "attivo": False,
+                  "_nota": ("Spento dalla 0.2.2: nei dati reali la mira registrata da Riot al momento "
+                            "della kill punta sulla vittima per TUTTI (errore mediano ~0.3 gradi, R=0.9995): "
+                            "il segnale non distingue nessuno.")},
         "burst": {"nome": "Kill a raffica <300 ms",  "mu": 1.3, "sigma": 1.2, "cap": 2.5, "minimo_scala": 0.03},
     },
     "soglia_raffica_ms": 300,
@@ -852,13 +859,16 @@ def stima_bayesiana(z_per_partita: List[Dict[str, Tuple]], voci_account: List[Di
     contributi = []
     tot_prest = 0.0
     for s, conf in P["segnali"].items():
+        if not conf.get("attivo", True):
+            contributi.append({"chiave": s, "nome": conf["nome"], "n": 0, "spento": True})
+            continue
         zs = [zp[s] for zp in z_per_partita if s in zp]
         if not zs:
             contributi.append({"chiave": s, "nome": conf["nome"], "n": 0})
             continue
         mu, sg = conf["mu"], conf["sigma"]
         llr = sum((mu * z - mu * mu / 2) / (sg * sg) for z, _, _ in zs)
-        llr = max(-conf["cap"], min(conf["cap"], llr))
+        llr = max(-min(conf["cap"], P["cap_negativo"]), min(conf["cap"], llr))
         tot_prest += llr
         contributi.append({
             "chiave": s, "nome": conf["nome"], "n": len(zs),
@@ -1252,7 +1262,7 @@ function scheda(g){
  const a=g.analisi;let corpo="";
  if(!a){corpo=`<div class="attesa">${g.stato_analisi==="errore"?"Errore: "+g.errore:(g.stato_analisi||"in attesa")+"..."}</div>`}
  else{const p=Math.round(a.prob*1000)/10;
-  let righe=a.contributi.map(c=>c.n?`<tr><td>${c.nome}</td><td class="n">${c.valore_testo}</td><td class="n sub">lobby ${c.lobby_testo}</td><td class="n ${c.llr>0?'piu':'meno'}">${f(c.llr)}</td></tr>`:`<tr><td>${c.nome}</td><td colspan=3 class="n sub">${c.chiave==='ang'&&!a.angolo_attivo?'in calibrazione':'nessun dato'}</td></tr>`).join("");
+  let righe=a.contributi.map(c=>c.n?`<tr><td>${c.nome}</td><td class="n">${c.valore_testo}</td><td class="n sub">lobby ${c.lobby_testo}</td><td class="n ${c.llr>0?'piu':'meno'}">${f(c.llr)}</td></tr>`:`<tr><td>${c.nome}</td><td colspan=3 class="n sub">${c.spento?'spento: non distingue nessuno':(c.chiave==='ang'&&!a.angolo_attivo?'in calibrazione':'nessun dato')}</td></tr>`).join("");
   let acc=a.account.map(v=>`<tr><td>${v.nome}</td><td class="n" colspan=2>${v.valore}</td><td class="n ${v.llr>0?'piu':(v.llr<0?'meno':'sub')}">${f(v.llr)}</td></tr>`).join("");
   corpo=`<div class="pc ${a.colore}">${p<1?"&lt;1":p.toFixed(p<10?1:0)}%</div>
   <div class="barra"><i class="bg-${a.colore}" style="width:${Math.max(2,p)}%"></i></div>
@@ -2290,7 +2300,9 @@ def esegui_test() -> bool:
     verifica(ris["demo-cheat"]["prob"] == max(r["prob"] for r in ris.values()), "il cheater evidente ha la probabilita' piu' alta")
     verifica(ris["demo-cheat"]["prob"] > 0.5, "il cheater evidente supera il 50%")
     verifica(ris["demo-closet"]["prob"] > max(normali), "il cheater discreto sta sopra tutti i normali")
-    verifica(max(normali) < 0.15, "nessun giocatore normale supera il 15%")
+    # Dalla 0.2.2 il segnale della mira e' spento (inutile sui dati reali): senza di
+    # lui un giocatore normale molto forte puo' salire. Soglia piu' larga, onesta.
+    verifica(max(normali) < 0.50, "nessun giocatore normale supera il 50%")
     verifica(ris["demo-smurf"]["prob"] < ris["demo-cheat"]["prob"], "lo smurf onesto sta sotto il cheater evidente")
 
     storia = [{"date": f"2026-10-{d:02d}", "match_id": f"m{d}", "last_change": c, "refunded_rr": 0}

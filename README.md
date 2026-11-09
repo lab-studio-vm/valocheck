@@ -76,6 +76,7 @@ Da quel momento Valocheck sincronizza da solo ogni 5 minuti mentre è aperto. Se
 ## Risultati finora
 
 - **Fase 0:** i rimborsi anti-cheat sono visibili nel campo ufficiale `RankedRatingRefundApplied` dello storico competitivo Riot. Su 932 partite di 53 giocatori: 6 rimborsi, coincidenti 6 su 6 con l'API Henrik. Il rimborso viene registrato sulla partita giocata **dopo** averlo ricevuto.
+- **Mira al momento della kill:** nei dati reali la direzione dello sguardo che Riot registra all'istante della kill punta sulla vittima per **tutti** i giocatori (errore mediano circa 0,3°, su quasi 5.000 kill). Il segnale quindi non distingue nessuno ed è **spento** dalla versione 0.2.2. Per la mira servirà un segnale diverso (Fase 3).
 
 ## File
 
