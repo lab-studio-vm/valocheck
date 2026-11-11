@@ -1,8 +1,10 @@
-# Valocheck
+# Valocheck (beta)
+
+> **Versione beta 0.4.0.** Il programma funziona, ma il modello non è ancora calibrato: i numeri vanno presi come indicazioni, non come verdetti.
 
 Stima la probabilità che i giocatori delle tue partite di VALORANT stiano barando, e raccoglie i dati per verificare e migliorare quella stima.
 
-- **In partita:** confronta ogni giocatore con gli altri delle sue ultime partite su headshot %, ADR, primi duelli, precisione angolare della mira al momento della kill e kill a raffica (meno di 300 ms tra due kill), più il profilo dell'account. Combina tutto in una stima bayesiana e mostra il risultato in una pagina del browser.
+- **In partita:** confronta ogni giocatore con gli altri delle sue ultime partite su headshot %, ADR, primi duelli e kill a raffica (meno di 300 ms tra due kill), tenendo conto del ruolo dell'agente, più il profilo dell'account. Combina tutto in una stima bayesiana e mostra il risultato in una pagina del browser, insieme a **grado attuale, peak** (con l'atto in cui è stato raggiunto) e **pause tra gli atti** (per esempio "tornato dopo 4 atti di pausa").
 - **Ricerca:** salva i **rimborsi di RR** che Riot dà dopo aver bannato un cheater (campo ufficiale `RankedRatingRefundApplied`). Incrociando i rimborsi ricevuti da persone diverse si individuano **cheater confermati**, con cui calibrare il modello.
 
 > ⚠️ Il risultato è una **stima statistica**, non una prova. I parametri del modello sono ipotesi iniziali finché non vengono calibrati sui dati raccolti.
@@ -64,7 +66,7 @@ Da quel momento Valocheck sincronizza da solo ogni 5 minuti mentre è aperto. Se
 | Opzione | Cosa fa |
 |---|---|
 | 1 | Fase 0: verifica di `refunded_rr` con l'API Henrik (già conclusa, serve una chiave Henrik) |
-| 2 | Fase 1: triangola i cheater confermati dai rimborsi |
+| 2 | Fase 1: incrocia gli avversari delle partite rimborsate e controlla chi ha smesso di giocare da prima del rimborso (un account bannato si ferma) |
 | 3 | Fase 2: ricontrolla chi è ancora attivo dopo 60 giorni (candidati "onesti") |
 | 4 | Esporta il dataset in CSV (per la Fase 4) |
 | 5 | Demo con una lobby simulata (non serve VALORANT) |
@@ -77,6 +79,36 @@ Da quel momento Valocheck sincronizza da solo ogni 5 minuti mentre è aperto. Se
 
 - **Fase 0:** i rimborsi anti-cheat sono visibili nel campo ufficiale `RankedRatingRefundApplied` dello storico competitivo Riot. Su 932 partite di 53 giocatori: 6 rimborsi, coincidenti 6 su 6 con l'API Henrik. Il rimborso viene registrato sulla partita giocata **dopo** averlo ricevuto.
 - **Mira al momento della kill:** nei dati reali la direzione dello sguardo che Riot registra all'istante della kill punta sulla vittima per **tutti** i giocatori (errore mediano circa 0,3°, su quasi 5.000 kill). Il segnale quindi non distingue nessuno ed è **spento** dalla versione 0.2.2. Per la mira servirà un segnale diverso (Fase 3).
+
+- **Somma delle sconfitte:** l'importo del rimborso coincide con la somma di sconfitte precedenti solo in 2 casi su 5, quindi dalla versione 0.3.0 la Fase 1 non si basa più su quello: considera tutte le sconfitte recenti e usa lo stop dell'attività dell'account come conferma.
+
+## Raccolta automatica (dalla 0.4.0)
+
+Mentre Valocheck è aperto, in sottofondo e lentamente (una richiesta ogni 3 secondi, con un tetto giornaliero):
+
+1. legge lo storico competitivo dei giocatori incontrati e cerca rimborsi;
+2. per ogni sconfitta recente di chi è stato rimborsato controlla gli altri 4 della sua squadra: se almeno 3 hanno anche loro un rimborso dopo quella partita, **quella** è la partita col cheater;
+3. tra i 5 vincitori cerca chi ha smesso di giocare da prima del rimborso: è il **probabile bannato**. Le sue ultime partite vengono salvate come esempi.
+
+Si ferma in selezione agente per lasciare il passo all'analisi della lobby. Si regola o si spegne in `parametri.json`, voce `raccolta`. Lo stato compare in fondo alla pagina; l'elenco è nel rapporto della Fase 1.
+
+## Segnali in prova (wallhack)
+
+Calcolati su ogni partita e salvati, ma **non entrano nella percentuale** finché i cheater confermati non mostrano quali funzionano:
+
+- **Sguardo verso i nemici:** nelle "fotografie" che Riot registra a ogni kill, quanto lo sguardo del giocatore punta verso un nemico quando non sta combattendo.
+- **Vicinanza al sito giusto:** in difesa, alla prima kill del round, quanto è vicino al sito dove poi viene piantata la spike rispetto ai compagni.
+- **Round vinti da ultimo rimasto** e **kill su nemici isolati.**
+- **Risultati alti con mira normale:** primi duelli e danno sopra la lobby con headshot nella media.
+
+La direzione dello sguardo di chi muore non è registrata, quindi "non viene mai preso alle spalle" non si può misurare.
+
+## Come leggere la Fase 1
+
+- **Confermato:** avversario in almeno 2 partite rimborsate diverse **e** fermo da prima del rimborso. È un'inferenza forte, non una dichiarazione di Riot.
+- **Sospetto:** una sola partita rimborsata e account fermo. Da solo non basta.
+- **Ancora attivo:** gioca ancora, quindi non risulta bannato.
+- **In gruppo con:** giocavano insieme; i rimborsi non dicono chi dei due barava.
 
 ## File
 

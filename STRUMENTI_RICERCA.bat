@@ -10,7 +10,7 @@ echo ==============================================
 echo   VALOCHECK - strumenti di ricerca
 echo ==============================================
 echo   1  Fase 0  - verifica refunded_rr con Henrik  (gia' fatta)
-echo   2  Fase 1  - triangola i cheater confermati  (Valorant aperto)
+echo   2  Fase 1  - dai rimborsi ai cheater  (Valorant aperto)
 echo   3  Fase 2  - ricontrolla chi e' ancora attivo dopo 60 giorni  (Valorant aperto)
 echo   4  Esporta il dataset in CSV  (per la Fase 4)
 echo   5  Demo con dati simulati  (non serve Valorant)

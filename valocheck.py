@@ -50,6 +50,7 @@ import json
 import math
 import os
 import random
+import re
 import socketserver
 import sqlite3
 import ssl
@@ -66,7 +67,7 @@ from datetime import datetime, timezone
 from itertools import combinations
 from typing import Dict, List, Optional, Tuple
 
-VERSIONE = "0.2.2"
+VERSIONE = "0.4.0-beta"
 
 if sys.platform == "win32":
     try:
@@ -94,6 +95,7 @@ PORTA_WEB = 5077
 # parametri.json, cosi' si possono cambiare senza toccare il codice.
 # Sono IPOTESI DI PARTENZA, non valori stimati: la Fase 4 serve a sostituirli.
 PARAMETRI_DEFAULT = {
+    "versione_parametri": 3,
     "_nota": ("Valori iniziali ipotetici, NON calibrati. mu = di quante "
               "'deviazioni' un cheater sta sopra la lobby in media; sigma = "
               "dispersione dei giocatori onesti; cap = massimo peso di un "
@@ -105,7 +107,10 @@ PARAMETRI_DEFAULT = {
     "_nota_cap_negativo": ("Massimo 'sconto' che un segnale nella norma puo' dare. Senza questo limite "
                            "un giocatore normale finisce sempre a 0.0%, cioe' certezza che non abbiamo."),
     "cap_negativo": 1.0,
-    "peso_profilo_account": 0.7,
+    "peso_profilo_account": 0.4,
+    "_nota_correlazione_tra_partite": ("Chi e' forte lo e' in tutte le partite: 6 partite non sono 6 prove "
+                                       "indipendenti. Con 0.5, sei partite valgono come circa 1.7."),
+    "correlazione_tra_partite": 0.5,
     "segnali": {
         "hs":    {"nome": "Headshot %",              "mu": 1.5, "sigma": 1.2, "cap": 3.0, "minimo_scala": 0.03},
         "adr":   {"nome": "ADR",                     "mu": 1.0, "sigma": 1.2, "cap": 2.0, "minimo_scala": 10.0},
@@ -115,7 +120,7 @@ PARAMETRI_DEFAULT = {
                   "_nota": ("Spento dalla 0.2.2: nei dati reali la mira registrata da Riot al momento "
                             "della kill punta sulla vittima per TUTTI (errore mediano ~0.3 gradi, R=0.9995): "
                             "il segnale non distingue nessuno.")},
-        "burst": {"nome": "Kill a raffica <300 ms",  "mu": 1.3, "sigma": 1.2, "cap": 2.5, "minimo_scala": 0.03},
+        "burst": {"nome": "Kill a raffica <300 ms",  "mu": 1.3, "sigma": 1.0, "cap": 2.5, "minimo_scala": 0.03},
     },
     "soglia_raffica_ms": 300,
     "distanza_minima_angolo": 500,
@@ -127,11 +132,20 @@ PARAMETRI_DEFAULT = {
         "rr_medio":  [[-1000, -5, -0.2], [-5, 8, 0.0], [8, 15, 0.2], [15, 1000, 0.6]],
         "salto_tier": [[-100, 4, 0.0], [4, 1000, 0.4]],
         "pausa_giorni": [[0, 30, 0.0], [30, 90, 0.2], [90, 100000, 0.4]],
+        "pausa_atti_recente": [[0, 2, 0.0], [2, 4, 0.3], [4, 1000, 0.6]],
         "partite_minime_winrate": 10,
     },
     "soglie_colore": {"giallo": 0.10, "rosso": 0.50},
-    "fase1": {"finestra_partite": 12, "max_partite_per_rimborso": 4, "tolleranza_rr": 1},
+    "fase1": {"finestra_partite": 12, "max_partite_per_rimborso": 4, "tolleranza_rr": 1,
+              "sconfitte_candidate": 8, "giorni_finestra": 30, "giorni_fermo": 5,
+              "max_controlli_attivita": 80},
     "fase2": {"giorni_minimi": 60, "giorni_attivita": 21},
+    "_nota_raccolta": ("Raccolta automatica in sottofondo. pausa_secondi = attesa tra una richiesta e l'altra; "
+                       "max_richieste_giorno = tetto giornaliero; allarga = legge anche i giocatori che compaiono "
+                       "nelle partite scaricate, non solo quelli delle tue lobby; attiva=false la spegne."),
+    "raccolta": {"attiva": True, "pausa_secondi": 3.0, "max_richieste_giorno": 4000, "allarga": True,
+                 "giorni_rilettura": 5, "perdenti_minimi": 3, "quota_perdenti": 0.6, "giorni_attesa_ban": 30},
+    "prova": {"distanza_minima_sguardo": 500, "distanza_isolato": 1500, "foto_minime": 15},
     "henrik_pausa_secondi": 2.2,
 }
 
@@ -156,7 +170,18 @@ def carica_parametri() -> Dict:
         return json.loads(json.dumps(PARAMETRI_DEFAULT))
     try:
         with open(FILE_PARAMETRI, "r", encoding="utf-8") as fh:
-            return _unisci(PARAMETRI_DEFAULT, json.load(fh))
+            salvati = json.load(fh)
+        if (salvati.get("versione_parametri") or 0) < PARAMETRI_DEFAULT["versione_parametri"]:
+            # Il modello e' cambiato: i vecchi numeri non valgono piu'. Li metto da
+            # parte (parametri_vecchi.json) e riparto dai nuovi valori predefiniti.
+            try:
+                os.replace(FILE_PARAMETRI, os.path.join(CARTELLA, "parametri_vecchi.json"))
+                with open(FILE_PARAMETRI, "w", encoding="utf-8") as fh:
+                    json.dump(PARAMETRI_DEFAULT, fh, ensure_ascii=False, indent=2)
+            except OSError:
+                pass
+            return json.loads(json.dumps(PARAMETRI_DEFAULT))
+        return _unisci(PARAMETRI_DEFAULT, salvati)
     except Exception:
         print("[!] parametri.json non leggibile: uso i valori predefiniti.")
         return json.loads(json.dumps(PARAMETRI_DEFAULT))
@@ -187,11 +212,15 @@ def http_json(metodo: str, url: str, headers: Optional[Dict] = None, corpo=None,
     if corpo is not None:
         dati = json.dumps(corpo).encode("utf-8")
         h.setdefault("Content-Type", "application/json")
+    if not locale:
+        h.setdefault("Accept-Encoding", "gzip")      # ~8 volte meno traffico
     req = urllib.request.Request(url, data=dati, headers=h, method=metodo)
     ctx = _SSL_LOCALE if locale else _SSL_REMOTO["ctx"]
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
             raw = r.read()
+            if (r.headers.get("Content-Encoding") or "").lower() == "gzip" or raw[:2] == b"\x1f\x8b":
+                raw = gzip.decompress(raw)
             try:
                 return r.status, json.loads(raw.decode("utf-8")), dict(r.headers)
             except ValueError:
@@ -223,6 +252,15 @@ VERSIONE_CLIENT_RISERVA = "release-13.08-shipping-20-5715960"
 MEDIA = "https://media.valorant-api.com"
 
 
+def nome_breve_atto(episodio: str, atto: str) -> str:
+    """'EPISODE 8' + 'ACT 3' -> 'E8A3';  'V25' + 'ACT 2' -> 'V25 A2'."""
+    e = re.sub(r"(?i)^\s*episode\s*(\d+)\s*$", r"E\1", episodio or "").strip()
+    a = re.sub(r"(?i)^\s*act\s*(\d+)\s*$", r"A\1", atto or "").strip()
+    if re.fullmatch(r"E\d+", e) and re.fullmatch(r"A\d+", a):
+        return e + a
+    return (e + " " + a).strip()
+
+
 class Contenuti:
     def __init__(self):
         self.versione_client = VERSIONE_CLIENT_RISERVA
@@ -231,6 +269,8 @@ class Contenuti:
         self.tier: Dict[str, str] = {}        # "24" -> "Immortal 1"
         self.atto_corrente = ""
         self.atti: Dict[str, str] = {}        # uuid -> nome
+        self.ruoli: Dict[str, str] = {}       # uuid agente -> ruolo
+        self.atti_ordinati: List[List] = []   # [uuid, nome breve, inizio ISO], dal piu' vecchio
         self._carica()
 
     def _carica(self):
@@ -243,7 +283,8 @@ class Contenuti:
             self._scaricato = 0
 
     def aggiorna(self, forza: bool = False):
-        if not forza and time.time() - getattr(self, "_scaricato", 0) < 12 * 3600 and self.agenti:
+        if not forza and time.time() - getattr(self, "_scaricato", 0) < 12 * 3600 and self.agenti \
+                and self.ruoli and self.atti_ordinati:
             return
 
         def get(ep):
@@ -256,6 +297,8 @@ class Contenuti:
         a = get("/agents?isPlayableCharacter=true")
         if isinstance(a, list):
             self.agenti = {x["uuid"].lower(): x["displayName"] for x in a if x.get("uuid")}
+            self.ruoli = {x["uuid"].lower(): ((x.get("role") or {}).get("displayName") or "")
+                          for x in a if x.get("uuid")}
         m = get("/maps")
         if isinstance(m, list):
             self.mappe = {x["mapUrl"]: x["displayName"] for x in m if x.get("mapUrl")}
@@ -266,6 +309,20 @@ class Contenuti:
         s = get("/seasons")
         if isinstance(s, list):
             ora = datetime.now(timezone.utc)
+            per_uuid = {x.get("uuid"): x for x in s}
+            ordinati = []
+            for x in s:
+                if "act" not in (x.get("type") or "").lower() or not x.get("startTime"):
+                    continue
+                try:
+                    if datetime.fromisoformat(x["startTime"].replace("Z", "+00:00")) > ora:
+                        continue
+                except Exception:
+                    continue
+                padre = (per_uuid.get(x.get("parentUuid")) or {}).get("displayName", "")
+                ordinati.append([x["uuid"], nome_breve_atto(padre, x.get("displayName", "")), x["startTime"]])
+            if ordinati:
+                self.atti_ordinati = sorted(ordinati, key=lambda t: t[2])
             for x in s:
                 self.atti[x.get("uuid", "")] = x.get("displayName", "")
                 if "act" not in (x.get("type") or "").lower():
@@ -281,12 +338,15 @@ class Contenuti:
         try:
             assicura_cartelle()
             d = {k: getattr(self, k) for k in ("versione_client", "agenti", "mappe", "tier",
-                                               "atto_corrente", "atti")}
+                                               "atto_corrente", "atti", "ruoli", "atti_ordinati")}
             d["_scaricato"] = self._scaricato
             with open(FILE_CONTENUTI, "w", encoding="utf-8") as fh:
                 json.dump(d, fh, ensure_ascii=False)
         except OSError:
             pass
+
+    def ruolo_agente(self, uuid: str) -> str:
+        return self.ruoli.get((uuid or "").lower(), "")
 
     def nome_agente(self, uuid: str) -> str:
         return self.agenti.get((uuid or "").lower(), "")
@@ -570,12 +630,14 @@ def estrai_partita(md: Dict) -> Optional[Dict]:
     if not md or not md.get("players"):
         return None
     info = md.get("matchInfo", {}) or {}
-    squadra, round_giocati, livello = {}, {}, {}
+    squadra, round_giocati, livello, agente, party = {}, {}, {}, {}, {}
     for p in md["players"]:
         u = _id(p)
         if not u or p.get("isObserver"):
             continue
         squadra[u] = p.get("teamId", "")
+        agente[u] = (p.get("characterId") or "").lower()
+        party[u] = p.get("partyId") or ""
         round_giocati[u] = (p.get("stats") or {}).get("roundsPlayed", 0) or 0
         livello[u] = p.get("accountLevel")
     vuoto = lambda: {"testa": 0, "corpo": 0, "gambe": 0, "danno": 0, "fk": 0, "fd": 0,
@@ -647,6 +709,7 @@ def estrai_partita(md: Dict) -> Optional[Dict]:
         "mappa": info.get("mapId", ""),
         "stagione": info.get("seasonId", ""),
         "squadra": squadra, "round": round_giocati, "livello": livello,
+        "agente": agente, "party": party,
         "vinto": {u: bool(vincitori.get(t)) for u, t in squadra.items()},
         "agg": agg,
     }
@@ -742,7 +805,7 @@ def z_in_lobby(valori: Dict[str, Dict], bersaglio: str) -> Dict[str, Tuple[float
             R = sum(v["_round"] for u, v in valori.items() if u != bersaglio and v.get(s) is not None)
             atteso = n * (K + 0.5) / (N + 1)
             z = 2 * (math.sqrt(k + 0.375) - math.sqrt(atteso + 0.375))
-            out[s] = (max(-6.0, min(6.0, z)), x, K / R if R else 0.0)
+            out[s] = (max(-6.0, min(6.0, z)), x, K / R if R else 0.0, k, atteso)
             continue
         cen = statistics.median(altri)
         mad = statistics.median([abs(a - cen) for a in altri]) * 1.4826
@@ -756,8 +819,210 @@ def z_in_lobby(valori: Dict[str, Dict], bersaglio: str) -> Dict[str, Tuple[float
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# SEGNALI IN PROVA (wallhack): calcolati e salvati, NON entrano nella stima
+# ════════════════════════════════════════════════════════════════════════════
+# A ogni kill (e a ogni spike piantata) Riot registra posizione e direzione
+# dello sguardo di TUTTI i giocatori vivi: sono "fotografie" di cosa stava
+# facendo ciascuno.  Da qui provo a misurare comportamenti tipici di chi vede
+# attraverso i muri.  Nessuno di questi segnali e' verificato: si salvano e
+# basta, finche' i cheater confermati non diranno quali funzionano.
+# (La direzione dello sguardo di chi MUORE non viene registrata, quindi
+# "non viene mai preso alle spalle" non si puo' misurare.)
+
+SEGNALI_PROVA = {
+    # chiave: (nome, True se un valore PIU' BASSO e' piu' sospetto)
+    "sguardo":   ("Sguardo verso i nemici (gradi)", True),
+    "rotazione": ("Vicinanza al sito giusto in difesa", True),
+    "clutch":    ("Round vinti da ultimo rimasto", False),
+    "isolati":   ("Kill su nemici isolati", False),
+    "divario":   ("Risultati alti con mira normale", False),
+}
+
+
+SCALA_MINIMA_PROVA = {"sguardo": 2.0, "rotazione": 0.15, "clutch": 0.08, "isolati": 0.08}
+
+
+def segnali_sperimentali(md: Dict, cal) -> Dict[str, Dict[str, Optional[float]]]:
+    """Valori grezzi dei segnali in prova, per ogni giocatore di una partita."""
+    if not md or not md.get("players"):
+        return {}
+    cfg = P["prova"]
+    squadra = {_id(p): p.get("teamId", "") for p in md["players"] if _id(p) and not p.get("isObserver")}
+    conv = CONVENZIONI[cal["convenzione"]] if cal and cal.get("affidabile") else None
+    scarto = cal["scarto"] if conv else 0.0
+    angoli = {u: [] for u in squadra}
+    rapporti = {u: [] for u in squadra}
+    clutch = {u: [0, 0] for u in squadra}
+    isolati = {u: [0, 0] for u in squadra}
+
+    def foto(locs, esclusi):
+        """Per ogni giocatore fotografato: angolo tra lo sguardo e il nemico verso cui guarda di piu'."""
+        if not conv:
+            return
+        pos = [(_id(pl), pl["location"].get("x", 0) or 0, pl["location"].get("y", 0) or 0, pl.get("viewRadians"))
+               for pl in locs or [] if pl.get("location") and _id(pl) in squadra]
+        for u, x, y, v in pos:
+            if u in esclusi or v is None:
+                continue
+            migliori = [abs(math.degrees(_avvolgi(float(v) - conv(ex - x, ey - y) - scarto)))
+                        for e, ex, ey, _ in pos
+                        if squadra[e] != squadra[u] and math.hypot(ex - x, ey - y) >= cfg["distanza_minima_sguardo"]]
+            if migliori:
+                angoli[u].append(min(migliori))
+
+    for r in md.get("roundResults") or []:
+        kills = sorted([k for ps in r.get("playerStats") or [] for k in ps.get("kills") or []], key=_t_round)
+        vincente = r.get("winningTeam")
+        ruolo_v = (r.get("winningTeamRole") or "").lower()
+        altre = [t for t in set(squadra.values()) if t != vincente]
+        difesa = vincente if ruolo_v == "defender" else (altre[0] if altre and ruolo_v == "attacker" else None)
+        t_spike = r.get("plantRoundTime") or 0
+        sito = r.get("plantLocation") or {}
+        piantata = t_spike > 0 and (sito.get("x") or sito.get("y"))
+        if piantata:
+            foto(r.get("plantPlayerLocations"), set())
+        # rotazione: alla prima kill prima della spike, quanto e' vicino ogni difensore al sito scelto
+        if piantata and difesa and kills and _t_round(kills[0]) < t_spike:
+            dist = {}
+            for pl in kills[0].get("playerLocations") or []:
+                u = _id(pl)
+                if squadra.get(u) == difesa and pl.get("location"):
+                    dist[u] = math.hypot((pl["location"].get("x", 0) or 0) - (sito.get("x") or 0),
+                                         (pl["location"].get("y", 0) or 0) - (sito.get("y") or 0))
+            if len(dist) >= 4:
+                for u, d in dist.items():
+                    altri = [v for w, v in dist.items() if w != u]
+                    rapporti[u].append(d / max(statistics.median(altri), 1.0))
+        vivi = {_id(ps) for ps in r.get("playerStats") or [] if _id(ps) in squadra}
+        segnati = set()
+        for k in kills:
+            kil, vit = k.get("killer"), k.get("victim")
+            foto(k.get("playerLocations"), {kil, vit} | set(k.get("assistants") or []))
+            if kil in squadra and vit in squadra and squadra[kil] != squadra[vit] \
+                    and ((k.get("finishingDamage") or {}).get("damageType") or "").lower() == "weapon":
+                vl = k.get("victimLocation") or {}
+                vicini = [math.hypot((pl["location"].get("x", 0) or 0) - (vl.get("x") or 0),
+                                     (pl["location"].get("y", 0) or 0) - (vl.get("y") or 0))
+                          for pl in k.get("playerLocations") or []
+                          if pl.get("location") and squadra.get(_id(pl)) == squadra[vit] and _id(pl) != vit]
+                isolati[kil][1] += 1
+                if vicini and min(vicini) >= cfg["distanza_isolato"]:
+                    isolati[kil][0] += 1
+            vivi.discard(vit)
+            for t in set(squadra.values()):
+                miei = [u for u in vivi if squadra[u] == t]
+                loro = [u for u in vivi if squadra[u] != t]
+                if len(miei) == 1 and len(loro) >= 2 and (miei[0], r.get("roundNum")) not in segnati:
+                    segnati.add((miei[0], r.get("roundNum")))
+                    clutch[miei[0]][1] += 1
+                    if vincente == t:
+                        clutch[miei[0]][0] += 1
+    out = {}
+    for u in squadra:
+        c, i = clutch[u], isolati[u]
+        out[u] = {
+            "sguardo": statistics.median(angoli[u]) if len(angoli[u]) >= cfg["foto_minime"] else None,
+            "rotazione": statistics.mean(rapporti[u]) if len(rapporti[u]) >= 3 else None,
+            # stima "lisciata": con poche occasioni non schizza a 0% o 100%
+            "clutch": (c[0] + 0.3) / (c[1] + 2) if c[1] >= 2 else None,
+            "isolati": i[0] / i[1] if i[1] >= 5 else None,
+            "_foto": len(angoli[u]), "_clutch": c[1], "_clutch_vinti": c[0],
+        }
+    return out
+
+
+def z_prova(valori: Dict[str, Dict], bersaglio: str) -> Dict[str, Tuple[float, float, float]]:
+    """Come z_in_lobby ma per i segnali in prova: (z, valore, mediana degli altri). z>0 = piu' sospetto."""
+    out = {}
+    mio = valori.get(bersaglio) or {}
+    for s, (_, basso) in SEGNALI_PROVA.items():
+        x = mio.get(s)
+        altri = [v[s] for u, v in valori.items() if u != bersaglio and v.get(s) is not None]
+        if x is None or len(altri) < 5:
+            continue
+        cen = statistics.median(altri)
+        mad = statistics.median([abs(a - cen) for a in altri]) * 1.4826
+        scala = max(mad, 0.5 * statistics.pstdev(altri), SCALA_MINIMA_PROVA.get(s, 0.05))
+        z = (x - cen) / scala
+        out[s] = (max(-6.0, min(6.0, -z if basso else z)), x, cen)
+    return out
+
+
+def riassumi_prova(z_per_partita: List[Dict]) -> List[Dict]:
+    out = []
+    for s, (nome, _) in SEGNALI_PROVA.items():
+        zs = [zp[s] for zp in z_per_partita if s in zp]
+        if zs:
+            out.append({"chiave": s, "nome": nome, "n": len(zs),
+                        "z_medio": round(statistics.mean(t[0] for t in zs), 2),
+                        "valore": round(statistics.mean(t[1] for t in zs), 3),
+                        "lobby": round(statistics.mean(t[2] for t in zs), 3)})
+    return out
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # PROFILO DELL'ACCOUNT
 # ════════════════════════════════════════════════════════════════════════════
+
+# Prima dell'Episodio 5 (22 giugno 2022) il grado Ascendant non esisteva: i
+# numeri dei gradi da Immortal in su valevano 3 in meno. Senza questa
+# correzione un vecchio Immortal 1 (21) verrebbe letto come Ascendant 1.
+INIZIO_ASCENDANT = "2022-06-22"
+
+
+def storia_atti(stag: Dict) -> Dict:
+    """Grado massimo (con l'atto in cui e' stato raggiunto) e pause tra gli atti."""
+    out = {"tier_max": 0, "atto_peak": ""}
+    nomi = {u: (nome, inizio) for u, nome, inizio in contenuti.atti_ordinati}
+    for uuid, info in stag.items():
+        nome, inizio = nomi.get(uuid, ("", ""))
+        vecchio = bool(inizio) and inizio[:10] < INIZIO_ASCENDANT
+        livelli = [info.get("CompetitiveTier") or 0]
+        for t in (info.get("WinsByTier") or {}):
+            try:
+                livelli.append(int(t))
+            except ValueError:
+                pass
+        m = max(livelli)
+        if vecchio and m >= 21:
+            m += 3
+        if m > out["tier_max"]:
+            out["tier_max"], out["atto_peak"] = m, nome
+    if not contenuti.atti_ordinati:
+        return out
+    giocato = [(stag.get(u) or {}).get("NumberOfGames", 0) > 0 for u, _, _ in contenuti.atti_ordinati]
+    if not any(giocato):
+        return out
+    primo = giocato.index(True)
+    ultimo = len(giocato) - 1 - giocato[::-1].index(True)
+    out["atti_giocati"] = sum(giocato)
+    out["primo_atto"] = contenuti.atti_ordinati[primo][1]
+    out["ultimo_atto"] = contenuti.atti_ordinati[ultimo][1]
+    out["atti_fermo"] = len(giocato) - 1 - ultimo            # atti passati dall'ultimo giocato
+    # pausa subito prima dell'ultimo atto giocato ("e' tornato dopo N atti")
+    recente, i = 0, ultimo - 1
+    while i >= primo and not giocato[i]:
+        recente += 1
+        i -= 1
+    out["pausa_atti_recente"] = recente
+    # pausa piu' lunga in tutta la storia dell'account
+    lunga = corrente = 0
+    for g in giocato[primo:ultimo + 1]:
+        corrente = 0 if g else corrente + 1
+        lunga = max(lunga, corrente)
+    out["pausa_atti_max"] = lunga
+    testo = []
+    if out["atti_fermo"] > 0:
+        testo.append(f"non gioca competitive da {out['atti_fermo']} "
+                     f"{'atto' if out['atti_fermo'] == 1 else 'atti'} (ultimo: {out['ultimo_atto']})")
+    if recente > 0:
+        testo.append(f"tornato in {out['ultimo_atto']} dopo {recente} "
+                     f"{'atto' if recente == 1 else 'atti'} di pausa")
+    elif lunga > 0:
+        testo.append(f"in passato si e' fermato per {lunga} {'atto' if lunga == 1 else 'atti'}")
+    out["pause_testo"] = "; ".join(testo)
+    return out
+
 
 def profilo_account(mmr: Optional[Dict], agg_comp: Optional[Dict], storico: Optional[Dict],
                     livello: Optional[int]) -> Dict:
@@ -767,7 +1032,7 @@ def profilo_account(mmr: Optional[Dict], agg_comp: Optional[Dict], storico: Opti
     atti = [s for s in stag.values() if (s.get("NumberOfGames") or 0) > 0]
     prof["stagioni"] = len(atti) if mmr else None
     cur = stag.get(contenuti.atto_corrente) if contenuti.atto_corrente else None
-    if cur is None and atti:
+    if cur is None and atti and not contenuti.atti_ordinati:
         cur = atti[-1]
     if cur and (cur.get("NumberOfGames") or 0) > 0:
         g = cur.get("NumberOfGames") or 0
@@ -776,18 +1041,13 @@ def profilo_account(mmr: Optional[Dict], agg_comp: Optional[Dict], storico: Opti
         prof["winrate"] = (w + 5) / (g + 10)          # media "prudente" (Beta 5,5)
         prof["tier"] = cur.get("CompetitiveTier", 0)
         prof["rr"] = cur.get("RankedRating", 0)
-    tier_max = 0
-    for s in stag.values():
-        tier_max = max(tier_max, s.get("CompetitiveTier") or 0)
-        for t in (s.get("WinsByTier") or {}):
-            try:
-                tier_max = max(tier_max, int(t))
-            except ValueError:
-                pass
-    prof["tier_max"] = tier_max
+    prof.update(storia_atti(stag))
     if not prof.get("tier"):
         lu = (mmr or {}).get("LatestCompetitiveUpdate") or {}
         prof["tier"] = lu.get("TierAfterUpdate", 0)
+        if prof["tier"] and lu.get("RankedRatingAfterUpdate") is not None:
+            prof["rr"] = lu.get("RankedRatingAfterUpdate")
+    prof["tier_max"] = max(prof.get("tier_max") or 0, prof.get("tier") or 0)
     m = [x for x in ((agg_comp or {}).get("Matches") or []) if x.get("TierAfterUpdate")]
     if len(m) >= 8:
         prof["rr_medio"] = statistics.mean(x.get("RankedRatingEarned", 0) or 0 for x in m)
@@ -815,13 +1075,15 @@ SPIEGAZIONI_ACCOUNT = {
     "rr_medio": "RR medio guadagnato a partita",
     "salto_tier": "Gradi saliti nelle ultime ~20 partite",
     "pausa_giorni": "Pausa piu' lunga tra due partite (giorni)",
+    "pausa_atti_recente": "Atti di pausa prima del ritorno",
 }
 
 
 def llr_account(prof: Dict) -> List[Dict]:
     tab = P["account"]
     voci = []
-    for chiave in ("livello", "stagioni", "winrate", "rr_medio", "salto_tier", "pausa_giorni"):
+    for chiave in ("livello", "stagioni", "winrate", "rr_medio", "salto_tier", "pausa_giorni",
+                   "pausa_atti_recente"):
         v = prof.get(chiave)
         if v is None:
             continue
@@ -858,6 +1120,7 @@ def stima_bayesiana(z_per_partita: List[Dict[str, Tuple]], voci_account: List[Di
                     confermato: bool = False) -> Dict:
     contributi = []
     tot_prest = 0.0
+    rho = P["correlazione_tra_partite"]
     for s, conf in P["segnali"].items():
         if not conf.get("attivo", True):
             contributi.append({"chiave": s, "nome": conf["nome"], "n": 0, "spento": True})
@@ -867,22 +1130,30 @@ def stima_bayesiana(z_per_partita: List[Dict[str, Tuple]], voci_account: List[Di
             contributi.append({"chiave": s, "nome": conf["nome"], "n": 0})
             continue
         mu, sg = conf["mu"], conf["sigma"]
-        llr = sum((mu * z - mu * mu / 2) / (sg * sg) for z, _, _ in zs)
+        n = len(zs)
+        if s == "burst" and all(len(t) >= 5 for t in zs):
+            # Eventi rari: sommo i conteggi di TUTTE le partite e faccio un solo confronto
+            # (osservate contro attese), invece di tante medie quasi vuote.
+            k_tot, attese = sum(t[3] for t in zs), sum(t[4] for t in zs)
+            z_usato = max(-6.0, min(6.0, 2 * (math.sqrt(k_tot + 0.375) - math.sqrt(attese + 0.375))))
+            n_eff = 1.0
+        else:
+            z_usato = statistics.mean(t[0] for t in zs)
+            n_eff = n / (1 + (n - 1) * rho)        # partite correlate: valgono meno di n prove
+        llr = n_eff * (mu * z_usato - mu * mu / 2) / (sg * sg)
         llr = max(-min(conf["cap"], P["cap_negativo"]), min(conf["cap"], llr))
         tot_prest += llr
         contributi.append({
-            "chiave": s, "nome": conf["nome"], "n": len(zs),
-            "z_medio": round(statistics.mean(z for z, _, _ in zs), 2),
-            "valore": statistics.mean(x for _, x, _ in zs),
-            "lobby": statistics.mean(c for _, _, c in zs),
+            "chiave": s, "nome": conf["nome"], "n": n,
+            "z_medio": round(z_usato, 2),
+            "valore": statistics.mean(t[1] for t in zs),
+            "lobby": statistics.mean(t[2] for t in zs),
             "llr": round(llr, 2),
         })
     tot_prest *= P["fattore_correlazione_segnali"]
     tot_acc = sum(v["llr"] for v in voci_account)
     logodds = _logit(P["prevalenza_a_priori"]) + tot_prest + tot_acc
     prob = _sigmoide(logodds)
-    if confermato:
-        prob = max(prob, 0.97)
     n_partite = len(z_per_partita)
     soglie = P["soglie_colore"]
     if prob >= soglie["rosso"]:
@@ -891,7 +1162,7 @@ def stima_bayesiana(z_per_partita: List[Dict[str, Tuple]], voci_account: List[Di
         colore, etichetta = "giallo", "Da tenere d'occhio"
     else:
         colore, etichetta = "verde", "Nessun segnale forte"
-    if n_partite < 3 and not confermato:
+    if n_partite < 3:
         etichetta += " (pochi dati)"
     return {"prob": prob, "colore": colore, "etichetta": etichetta, "n_partite": n_partite,
             "llr_prestazioni": round(tot_prest, 2), "llr_account": round(tot_acc, 2),
@@ -937,7 +1208,21 @@ class Database:
                 ultima_partita_ms REAL, esito TEXT, PRIMARY KEY(puuid, ts));
             CREATE TABLE IF NOT EXISTS squadre(match_id TEXT, puuid TEXT, team TEXT,
                 PRIMARY KEY(match_id, puuid));
+            CREATE TABLE IF NOT EXISTS candidati(puuid TEXT PRIMARY KEY, stato TEXT, punteggio REAL,
+                n_partite INTEGER, n_eventi INTEGER, ultima_partita_ms REAL, t_rimborso_ms REAL,
+                gruppo TEXT, partite TEXT, ts REAL);
+            CREATE TABLE IF NOT EXISTS raccolta(puuid TEXT PRIMARY KEY, ts REAL, esito TEXT);
+            CREATE TABLE IF NOT EXISTS partite_verificate(match_id TEXT PRIMARY KEY, ts REAL, t_partita_ms REAL,
+                t_rimborso_ms REAL, perdenti_dati INTEGER, perdenti_rimborsati INTEGER, stato TEXT,
+                squadra_persa TEXT);
+            CREATE TABLE IF NOT EXISTS bannati(puuid TEXT PRIMARY KEY, match_id TEXT, ultima_partita_ms REAL,
+                t_rimborso_ms REAL, perdenti_rimborsati INTEGER, perdenti_dati INTEGER, n_fermi INTEGER,
+                stato TEXT, ts REAL);
+            CREATE TABLE IF NOT EXISTS stato(chiave TEXT PRIMARY KEY, valore TEXT);
             """)
+            colonne = [r[1] for r in self.con.execute("PRAGMA table_info(squadre)")]
+            if "party" not in colonne:
+                self.con.execute("ALTER TABLE squadre ADD COLUMN party TEXT DEFAULT ''")
             self.con.commit()
 
     def esegui(self, sql, args=()):
@@ -959,21 +1244,106 @@ class Database:
                      an["n_partite"], json.dumps({"analisi": an, "profilo": extra}, default=str)))
 
     def salva_squadre(self, partita: Dict):
+        party = partita.get("party") or {}
         with self.lock:
-            self.con.executemany("INSERT OR IGNORE INTO squadre VALUES(?,?,?)",
-                                 [(partita["match_id"], u, t) for u, t in partita["squadra"].items()])
+            self.con.executemany(
+                "INSERT INTO squadre(match_id,puuid,team,party) VALUES(?,?,?,?) "
+                "ON CONFLICT(match_id,puuid) DO UPDATE SET party=CASE WHEN excluded.party<>'' "
+                "THEN excluded.party ELSE squadre.party END",
+                [(partita["match_id"], u, t, party.get(u, "")) for u, t in partita["squadra"].items()])
             self.con.commit()
 
     def squadre_di(self, match_id) -> Dict[str, str]:
         return {u: t for u, t in self.esegui("SELECT puuid, team FROM squadre WHERE match_id=?", (match_id,))}
 
-    def e_confermato(self, puuid) -> bool:
-        return bool(self.esegui("SELECT 1 FROM confermati WHERE puuid=?", (puuid,)))
+    def compagni_di_gruppo(self, puuid, match_ids) -> List[str]:
+        """Chi era nello stesso gruppo (party) del giocatore in quelle partite."""
+        out = set()
+        for mid in match_ids:
+            r = self.esegui("SELECT team, party FROM squadre WHERE match_id=? AND puuid=?", (mid, puuid))
+            if r and r[0][1]:
+                out.update(x[0] for x in self.esegui(
+                    "SELECT puuid FROM squadre WHERE match_id=? AND team=? AND party=? AND puuid<>?",
+                    (mid, r[0][0], r[0][1], puuid)))
+        return sorted(out)
+
+    def segnalazione(self, puuid) -> str:
+        b = self.esegui("SELECT perdenti_rimborsati, perdenti_dati, stato FROM bannati WHERE puuid=?", (puuid,))
+        if b:
+            return (f"dopo una sua partita vinta {b[0][0]} avversari su {b[0][1]} sono stati rimborsati e l'account "
+                    "si e' fermato" + ("" if b[0][2] == "bannato" else " (ma non e' l'unico fermo di quella squadra)"))
+        r = self.esegui("SELECT stato, n_partite FROM candidati WHERE puuid=?", (puuid,))
+        if not r or (r[0][1] or 0) < 2:
+            return ""
+        return f"era avversario in {r[0][1]} partite seguite da un rimborso anti-cheat"
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # ANALIZZATORE: scarica i dati di un giocatore e calcola la stima
 # ════════════════════════════════════════════════════════════════════════════
+
+class StatRuoli:
+    """Quanto, in media, ogni ruolo sta sopra o sotto la lobby su ciascun segnale.
+
+    Un duellante fa piu' primi duelli e piu' danno di un controller per come e'
+    fatto il gioco, non perche' bara.  Per ogni partita letta calcolo lo z di
+    TUTTI e 10 i giocatori e tengo la media per ruolo; quella media viene poi
+    tolta allo z del giocatore analizzato.  La correzione parte solo dopo 40
+    osservazioni per ruolo ed e' "frenata" finche' i dati sono pochi.
+    """
+    SEGNALI = ("hs", "adr", "fk")
+
+    def __init__(self, percorso: Optional[str]):
+        self.percorso = percorso
+        self.somme: Dict[str, Dict[str, List[float]]] = {}
+        self.viste: List[str] = []
+        self._insieme = set()
+        self.lock = threading.Lock()
+        if percorso:
+            try:
+                with open(percorso, "r", encoding="utf-8") as fh:
+                    d = json.load(fh)
+                self.somme, self.viste = d.get("somme", {}), d.get("viste", [])
+                self._insieme = set(self.viste)
+            except Exception:
+                pass
+
+    def aggiungi(self, partita: Dict, valori: Dict):
+        mid = partita["match_id"]
+        with self.lock:
+            if not mid or mid in self._insieme:
+                return
+            self._insieme.add(mid)
+            self.viste.append(mid)
+        for u in partita["squadra"]:
+            ruolo = contenuti.ruolo_agente(partita.get("agente", {}).get(u, ""))
+            if not ruolo:
+                continue
+            z = z_in_lobby(valori, u)
+            with self.lock:
+                for sg in self.SEGNALI:
+                    if sg in z:
+                        t = self.somme.setdefault(ruolo, {}).setdefault(sg, [0.0, 0])
+                        t[0] += z[sg][0]
+                        t[1] += 1
+
+    def scarto(self, ruolo: str, segnale: str) -> float:
+        t = (self.somme.get(ruolo) or {}).get(segnale)
+        if not t or t[1] < 40:
+            return 0.0
+        return t[0] / (t[1] + 20)
+
+    def salva(self):
+        if not self.percorso:
+            return
+        try:
+            with self.lock:
+                d = {"somme": self.somme, "viste": self.viste[-5000:]}
+            with open(self.percorso, "w", encoding="utf-8") as fh:
+                json.dump(d, fh)
+        except OSError:
+            pass
+
 
 class Analizzatore:
     def __init__(self, api, db: Optional[Database], lavoratori: int = 3, dati_reali: bool = True):
@@ -987,6 +1357,7 @@ class Analizzatore:
         self._visti_geom = set()
         self.cal = None
         self._n_cal = 0
+        self.ruoli = StatRuoli(os.path.join(DATI, "statistiche_ruoli.json") if dati_reali else None)
         if dati_reali:
             try:
                 with open(FILE_CALIBRAZIONE, "r", encoding="utf-8") as fh:
@@ -1060,15 +1431,41 @@ class Analizzatore:
             ids += [h["MatchID"] for h in ((comp_st or {}).get("History") or []) if h["MatchID"] not in ids]
         ids = ids[:P["partite_da_analizzare"]]
         partite = []
+        grezze = {}
         for mid in ids:
-            p = estrai_partita(self.api.dettagli_partita(mid))
+            md = self.api.dettagli_partita(mid)
+            p = estrai_partita(md)
             if p and puuid in p["squadra"]:
                 partite.append(p)
+                grezze[p["match_id"]] = md
                 self._aggiungi_geometria(p)
                 if self.db and self.dati_reali:
                     self.db.salva_squadre(p)
         cal = self.calibrazione()
-        zs = [z for z in (z_in_lobby(valori_segnali(p, cal), puuid) for p in partite) if z]
+        zs = []
+        zs_prova = []
+        for p in partite:
+            valori = valori_segnali(p, cal)
+            self.ruoli.aggiungi(p, valori)
+            z = z_in_lobby(valori, puuid)
+            # segnali in prova: salvati, non contano nella stima
+            try:
+                zp = z_prova(segnali_sperimentali(grezze.get(p["match_id"]), cal), puuid)
+                if all(k in z for k in ("hs", "adr", "fk")):
+                    d = (z["fk"][0] + z["adr"][0]) / 2 - z["hs"][0]
+                    zp["divario"] = (max(-6.0, min(6.0, d)), d, 0.0)
+                if zp:
+                    zs_prova.append(zp)
+            except Exception:  # noqa: BLE001
+                pass
+            ruolo = contenuti.ruolo_agente(p.get("agente", {}).get(puuid, ""))
+            for sg in StatRuoli.SEGNALI:
+                if sg in z and ruolo:
+                    t = z[sg]
+                    z[sg] = (max(-6.0, min(6.0, t[0] - self.ruoli.scarto(ruolo, sg))),) + tuple(t[1:])
+            if z:
+                zs.append(z)
+        self.ruoli.salva()
         if livello is None:
             for p in partite:
                 if p["livello"].get(puuid):
@@ -1078,8 +1475,7 @@ class Analizzatore:
             registra_rimborsi_riot(self.db, puuid, comp)     # raccolta passiva per la Fase 1
         prof = profilo_account(mmr, comp, storico, livello)
         voci = llr_account(prof)
-        confermato = self.db.e_confermato(puuid) if self.db else False
-        an = stima_bayesiana(zs, voci, confermato)
+        an = stima_bayesiana(zs, voci)
         for c in an["contributi"]:
             if c.get("n"):
                 c["valore_testo"] = formatta_segnale(c["chiave"], c["valore"])
@@ -1087,8 +1483,16 @@ class Analizzatore:
         if not partite:
             an["etichetta"] = "Nessuna partita recente leggibile"
             an["colore"] = "grigio"
+        an["prova"] = riassumi_prova(zs_prova)
+        agenti = [contenuti.nome_agente(p.get("agente", {}).get(puuid, "")) for p in partite]
+        an["agenti"] = [a for a in agenti if a]
         an["grado"] = contenuti.nome_tier(prof.get("tier") or 0)
+        if prof.get("tier") and prof.get("rr") is not None and prof.get("tier", 0) >= 3:
+            an["grado"] += f" ({prof['rr']} RR)"
         an["grado_max"] = contenuti.nome_tier(prof.get("tier_max") or 0)
+        an["atto_peak"] = prof.get("atto_peak") or ""
+        an["pause"] = prof.get("pause_testo") or ""
+        an["segnalazione"] = self.db.segnalazione(puuid) if self.db else ""
         an["angolo_attivo"] = bool(cal and cal.get("affidabile"))
         if self.db:
             self.db.salva_osservazione(puuid, an, prof)
@@ -1140,6 +1544,8 @@ class Monitor:
         if stato in ("PREGAME", "INGAME") and mid and (mid != self.match_id or stato != self.stato):
             if self._costruisci_lobby(stato, mid):
                 self.match_id = mid
+        elif stato == "PREGAME" and mid == self.match_id:
+            self._aggiorna_agenti(mid)          # gli agenti si scelgono dopo l'ingresso
         self.stato = stato
         if stato == "MENU":
             self.messaggio = ("Nel menu. Quando entri in selezione agente l'analisi parte da sola."
@@ -1149,6 +1555,22 @@ class Monitor:
                               "Gli avversari compaiono appena la partita carica.")
         elif stato == "INGAME":
             self.messaggio = "Partita in corso: analisi di tutti e 10 i giocatori."
+
+    def _aggiorna_agenti(self, mid):
+        """In selezione agente aggiorna solo agente e icona (niente nuove analisi)."""
+        info = self.api.partita_pregame(mid)
+        if not info:
+            return
+        scelte = {g.get("Subject"): g.get("CharacterID", "")
+                  for g in (info.get("AllyTeam") or {}).get("Players") or []}
+        with self.lock:
+            for x in self.lobby:
+                ag = scelte.get(x["puuid"])
+                if ag:
+                    x["agente"] = contenuti.nome_agente(ag) or (ag if len(ag) < 20 else x["agente"])
+                    x["icona"] = contenuti.icona_agente(ag) if contenuti.nome_agente(ag) else x["icona"]
+                    if x["nascosto"] and not x["io"]:
+                        x["nome"] = f"Nascosto ({x['agente'] or '?'})"
 
     def _costruisci_lobby(self, stato, mid) -> bool:
         if stato == "PREGAME":
@@ -1212,7 +1634,7 @@ class Monitor:
         return {"stato": self.stato, "messaggio": self.messaggio, "mappa": mappa,
                 "giocatori": lobby, "versione": VERSIONE,
                 "calibrazione": cal, "prevalenza": P["prevalenza_a_priori"],
-                "condivisione": STATO_CONDIVISIONE["testo"]}
+                "condivisione": STATO_CONDIVISIONE["testo"], "raccolta": STATO_RACCOLTA["testo"]}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1248,6 +1670,8 @@ td{padding:2px 0}td.n{text-align:right;font-variant-numeric:tabular-nums}
 .piu{color:var(--rosso)}.meno{color:var(--verde)}
 footer{color:var(--dim);font-size:12px;padding:18px 22px;max-width:1250px;margin:auto}
 .attesa{color:var(--dim);margin-top:10px}
+.rk{font-size:12px;margin-top:8px;color:var(--dim)}.rk b{color:var(--txt);font-weight:600}
+.pausa{font-size:12px;margin-top:3px;color:var(--giallo)}.segn{font-size:12px;margin-top:3px;color:var(--rosso)}
 </style></head><body>
 <header><h1><b>VALO</b>CHECK</h1><span id="stato">...</span><span id="msg"></span><span id="mappa" class="sub"></span></header>
 <main><div id="vuoto" class="attesa"></div>
@@ -1266,10 +1690,14 @@ function scheda(g){
   let acc=a.account.map(v=>`<tr><td>${v.nome}</td><td class="n" colspan=2>${v.valore}</td><td class="n ${v.llr>0?'piu':(v.llr<0?'meno':'sub')}">${f(v.llr)}</td></tr>`).join("");
   corpo=`<div class="pc ${a.colore}">${p<1?"&lt;1":p.toFixed(p<10?1:0)}%</div>
   <div class="barra"><i class="bg-${a.colore}" style="width:${Math.max(2,p)}%"></i></div>
-  <div class="et ${a.colore}">${a.confermato?"CONFERMATO dalla triangolazione":a.etichetta}</div>
-  <div class="det"><div class="sub">Grado ${a.grado} · max ${a.grado_max} · ${a.n_partite} partite confrontate</div>
+  <div class="et ${a.colore}">${a.etichetta}</div>
+  <div class="rk"><b>${a.grado}</b> · peak <b>${a.grado_max}</b>${a.atto_peak?" ("+a.atto_peak+")":""}</div>
+  ${a.pause?`<div class="pausa">⏸ ${a.pause}</div>`:""}
+  ${a.segnalazione?`<div class="segn">⚑ ${a.segnalazione}</div>`:""}
+  <div class="det"><div class="sub">${a.n_partite} partite confrontate con la lobby</div>
   <table><tr><td colspan=4 class="sub"><b>Prestazioni vs lobby</b> (peso totale ${f(a.llr_prestazioni)})</td></tr>${righe}
-  <tr><td colspan=4 class="sub"><br><b>Profilo account</b> (peso totale ${f(a.llr_account)})</td></tr>${acc}</table>
+  <tr><td colspan=4 class="sub"><br><b>Profilo account</b> (peso totale ${f(a.llr_account)})</td></tr>${acc}
+  ${(a.prova||[]).length?`<tr><td colspan=4 class="sub"><br><b>Segnali in prova</b> (non contano nel numero; z>0 = più sospetto)</td></tr>`+a.prova.map(c=>`<tr><td class="sub">${c.nome}</td><td class="n sub">${c.valore}</td><td class="n sub">lobby ${c.lobby}</td><td class="n sub">z ${f(c.z_medio)}</td></tr>`).join(""):""}</table>
   <div class="sub"><br>I numeri a destra sono "pesi" in log-odds: positivo spinge verso cheater, negativo verso onesto.</div></div>`}
  return `<div class="g ${g.io?'io':''} ${aperti.has(g.puuid)?'aperto':''}" data-p="${g.puuid}">
  <div class="top">${g.icona?`<img src="${g.icona}" alt="">`:''}<div style="min-width:0">
@@ -1286,7 +1714,7 @@ async function aggiorna(){
   document.getElementById("h-avv").style.display=av.length?"":"none";
   document.getElementById("vuoto").textContent=d.giocatori.length?"":"Nessuna lobby ancora. Entra in coda: i giocatori appaiono in selezione agente.";
   const c=d.calibrazione;
-  document.getElementById("piede").innerHTML=`Valocheck ${d.versione} · probabilità a priori ${(d.prevalenza*100).toFixed(1)}% · calibrazione angolo: ${c?(c.affidabile?"attiva (R="+c.R.toFixed(2)+", "+c.n+" kill)":"NON affidabile, segnale spento"):"in corso"} · dati condivisi: ${d.condivisione||"—"}<br>
+  document.getElementById("piede").innerHTML=`Valocheck ${d.versione} · probabilità a priori ${(d.prevalenza*100).toFixed(1)}% · calibrazione angolo: ${c?(c.affidabile?"attiva (R="+c.R.toFixed(2)+", "+c.n+" kill)":"NON affidabile, segnale spento"):"in corso"} · dati condivisi: ${d.condivisione||"—"}<br>raccolta automatica: ${d.raccolta||"—"}<br>
   È una stima statistica con parametri ancora da calibrare (Fase 4), non una prova. Clicca un giocatore per vedere il perché del numero.`;
  }catch(e){document.getElementById("msg").textContent="Valocheck non risponde (finestra chiusa?)"}}
 document.addEventListener("click",e=>{const g=e.target.closest(".g");if(!g)return;const p=g.dataset.p;
@@ -1388,11 +1816,13 @@ def _mio_codice() -> str:
 
 def esporta_condivisi(db: Database, cartella: str) -> int:
     dati = {
-        "formato": 1, "versione": VERSIONE, "contributore": _mio_codice(), "aggiornato": time.time(),
+        "formato": 3, "versione": VERSIONE, "contributore": _mio_codice(), "aggiornato": time.time(),
         "giocatori": db.esegui("SELECT puuid, prima_vista, ultima_vista FROM giocatori"),
         "rimborsi": db.esegui("SELECT puuid, match_id, data, rr, fonte, partite_candidate FROM rimborsi"),
-        "squadre": db.esegui("SELECT match_id, puuid, team FROM squadre"),
+        "squadre": db.esegui("SELECT match_id, puuid, team, party FROM squadre"),
         "controlli_attivita": db.esegui("SELECT puuid, ts, ultima_partita_ms, esito FROM controlli_attivita"),
+        "partite_verificate": db.esegui("SELECT * FROM partite_verificate WHERE stato<>'pochi_dati'"),
+        "bannati": db.esegui("SELECT * FROM bannati"),
         "osservazioni": db.esegui(
             "SELECT o.puuid, o.ts, o.prob, o.llr_prestazioni, o.llr_account, o.n_partite, o.dettagli "
             "FROM osservazioni o JOIN (SELECT puuid, MAX(ts) m FROM osservazioni GROUP BY puuid) u "
@@ -1428,9 +1858,14 @@ def importa_condivisi(db: Database, cartella: str) -> Tuple[int, int]:
             c.executemany("INSERT OR IGNORE INTO rimborsi VALUES(?,?,?,?,?,?)",
                           [tuple(x) for x in d.get("rimborsi", [])])
             n_rimb += c.execute("SELECT COUNT(*) FROM rimborsi").fetchone()[0] - prima
-            c.executemany("INSERT OR IGNORE INTO squadre VALUES(?,?,?)", [tuple(x) for x in d.get("squadre", [])])
+            c.executemany("INSERT OR IGNORE INTO squadre(match_id,puuid,team,party) VALUES(?,?,?,?)",
+                          [(tuple(x) + ("",))[:4] for x in d.get("squadre", [])])
             c.executemany("INSERT OR IGNORE INTO controlli_attivita VALUES(?,?,?,?)",
                           [tuple(x) for x in d.get("controlli_attivita", [])])
+            c.executemany("INSERT OR IGNORE INTO partite_verificate VALUES(?,?,?,?,?,?,?,?)",
+                          [tuple(x) for x in d.get("partite_verificate", []) if len(x) == 8])
+            c.executemany("INSERT OR IGNORE INTO bannati VALUES(?,?,?,?,?,?,?,?,?)",
+                          [tuple(x) for x in d.get("bannati", []) if len(x) == 9])
             for o in d.get("osservazioni", []):
                 if not c.execute("SELECT 1 FROM osservazioni WHERE puuid=? AND ts=?", (o[0], o[1])).fetchone():
                     c.execute("INSERT INTO osservazioni(puuid,ts,prob,llr_prestazioni,llr_account,n_partite,dettagli)"
@@ -1571,6 +2006,8 @@ def interpreta_rimborsi(storia: List[Dict]) -> List[Dict]:
 
 def partite_rimborsate(ev: Dict) -> List[Tuple[str, float]]:
     """Partite candidate (con peso) a essere quella col cheater."""
+    if ev.get("candidate") is not None:
+        return [tuple(x) for x in ev["candidate"]]
     if ev.get("ipotesi_A"):
         return [(ev["match_id"], 1.0)]
     comb = ev.get("combinazioni_B") or []
@@ -1783,9 +2220,19 @@ def scomponi_aggiornamenti(comp: Optional[Dict]) -> List[Dict]:
                 for cc in combinations(perse, k):
                     if abs(sum(-(x.get("RankedRatingEarned") or 0) for x in cc) - rimborso) <= P["fase1"]["tolleranza_rr"]:
                         comb.append([x.get("MatchID") for x in cc])
+        # Fase 0b: la somma coincide solo in 2 casi su 5, quindi NON basta.  Le
+        # partite candidate sono tutte le sconfitte recenti prima del rimborso,
+        # con lo stesso peso; a scegliere tra gli avversari ci pensa la Fase 1.
+        cfg = P["fase1"]
+        t_rimb = c.get("MatchStartTime") or 0
+        recenti = [x for x in perse if not t_rimb or not x.get("MatchStartTime")
+                   or t_rimb - x["MatchStartTime"] <= cfg["giorni_finestra"] * 86400000]
+        recenti = recenti[-cfg["sconfitte_candidate"]:]
+        candidate = [[x.get("MatchID"), round(1 / len(recenti), 4)] for x in recenti] if rimborso > 0 else []
         out.append({"match_id": c.get("MatchID"), "ora": c.get("MatchStartTime"), "residuo": residuo,
                     "tipo": tipo, "rimborso": max(0, rimborso), "guadagnato": guad,
-                    "bonus": bonus, "afk": afk, "combinazioni_B": comb[:50], "ipotesi_A": False})
+                    "bonus": bonus, "afk": afk, "combinazioni_B": comb[:50], "ipotesi_A": False,
+                    "candidate": candidate})
     return out
 
 
@@ -1888,18 +2335,51 @@ def fase0b():
 # sola i candidati sono 5 (tutta la squadra avversaria): servono almeno 2
 # partite rimborsate distinte per isolarne uno.
 
-def triangola(api, db: Database, stampa=print) -> List[Tuple[str, float, int]]:
+def _ms(data) -> float:
+    """Momento del rimborso in millisecondi (i dati Riot sono gia' ms, Henrik usa una data)."""
+    try:
+        return float(data)
+    except (TypeError, ValueError):
+        try:
+            return datetime.fromisoformat(str(data).replace("Z", "+00:00")).timestamp() * 1000
+        except Exception:
+            return 0.0
+
+
+ETICHETTE_STATO = {
+    "confermato": "CONFERMATO (2+ partite rimborsate, account fermo da prima del rimborso)",
+    "sospetto": "sospetto (1 partita rimborsata, account fermo da prima del rimborso)",
+    "attivo": "ancora attivo (2+ partite rimborsate ma gioca ancora: non risulta bannato)",
+    "candidato": "candidato (2+ partite rimborsate, attivita' non controllata)",
+}
+
+
+def triangola(api, db: Database, stampa=print) -> List[Dict]:
+    """Dai rimborsi ai probabili cheater.
+
+    1. Ogni rimborso indica le sconfitte recenti di chi l'ha ricevuto: il cheater
+       era tra gli avversari di una di quelle.  Ogni avversario prende un punteggio.
+    2. Chi compare in piu' partite rimborsate DIVERSE sale in classifica.
+    3. Controllo decisivo: un account bannato smette di giocare.  Se l'ultima
+       partita del candidato e' precedente al rimborso e da allora non ha piu'
+       giocato, il quadro torna; se gioca ancora, non e' stato bannato.
+    4. Chi era in gruppo (party) con il candidato viene segnalato: compare nelle
+       stesse partite ma puo' essere solo il compagno di chi bara.
+    """
+    cfg = P["fase1"]
     punteggio: Dict[str, float] = {}
     partite: Dict[str, set] = {}
+    eventi: Dict[str, set] = {}
+    t_min: Dict[str, float] = {}
     visti = set()
-    # Lo stesso rimborso puo' essere salvato da piu' fonti (Riot, Henrik, altri
-    # partecipanti): va contato UNA volta sola.  Preferisco la fonte Riot.
-    for puuid, mid_rimb, cand_json in db.esegui(
-            "SELECT puuid, match_id, partite_candidate FROM rimborsi "
+    # Lo stesso rimborso puo' essere salvato da piu' fonti: va contato UNA volta sola.
+    for puuid, mid_rimb, data, cand_json in db.esegui(
+            "SELECT puuid, match_id, data, partite_candidate FROM rimborsi "
             "ORDER BY CASE fonte WHEN 'riot' THEN 0 ELSE 1 END"):
         if (puuid, mid_rimb) in visti:
             continue
         visti.add((puuid, mid_rimb))
+        t = _ms(data)
         for mid, peso in json.loads(cand_json or "[]"):
             squadra = db.squadre_di(mid)
             if puuid not in squadra and api is not None:
@@ -1910,68 +2390,349 @@ def triangola(api, db: Database, stampa=print) -> List[Tuple[str, float, int]]:
             if puuid not in squadra:
                 continue
             mia = squadra[puuid]
-            for c, t in squadra.items():
-                if t != mia:
+            for c, tm in squadra.items():
+                if tm != mia:
                     punteggio[c] = punteggio.get(c, 0) + peso
                     partite.setdefault(c, set()).add(mid)
-    classifica = sorted(((c, s, len(partite[c])) for c, s in punteggio.items()), key=lambda x: -x[1])
-    for c, s, n in classifica:
-        if n >= 2 and s >= 1.5:
-            db.esegui("INSERT OR REPLACE INTO confermati VALUES(?,?,?,?,?)",
-                      (c, s, n, json.dumps(sorted(partite[c])), time.time()))
-    return classifica
+                    eventi.setdefault(c, set()).add((puuid, mid_rimb))
+                    if t:
+                        t_min[c] = min(t_min.get(c, t), t)
+    ordine = sorted(punteggio, key=lambda c: (-len(partite[c]), -punteggio[c]))
+    ora_ms = time.time() * 1000
+    risultati = []
+    db.esegui("DELETE FROM candidati")
+    for i, c in enumerate(ordine):
+        n = len(partite[c])
+        ultima, fermo = None, None
+        if api is not None and i < cfg["max_controlli_attivita"]:
+            st = api.storico_partite(c, 3)
+            if st is not None:
+                tempi = [h.get("GameStartTime", 0) for h in (st.get("History") or [])]
+                ultima = max(tempi) if tempi else 0
+                fermo = bool(t_min.get(c)) and ultima <= t_min[c] \
+                    and ora_ms - ultima >= cfg["giorni_fermo"] * 86400000
+            if stampa and (i + 1) % 20 == 0:
+                stampa(f"   controllo attivita' dei candidati: {i + 1}/{min(len(ordine), cfg['max_controlli_attivita'])}")
+        if n >= 2 and fermo:
+            stato = "confermato"
+        elif n >= 2 and fermo is False:
+            stato = "attivo"
+        elif n >= 2:
+            stato = "candidato"
+        elif fermo:
+            stato = "sospetto"
+        else:
+            continue
+        gruppo = db.compagni_di_gruppo(c, partite[c])
+        db.esegui("INSERT OR REPLACE INTO candidati VALUES(?,?,?,?,?,?,?,?,?,?)",
+                  (c, stato, punteggio[c], n, len(eventi[c]), ultima, t_min.get(c),
+                   json.dumps(gruppo), json.dumps(sorted(partite[c])), time.time()))
+        risultati.append({"puuid": c, "stato": stato, "punteggio": punteggio[c], "n_partite": n,
+                          "n_eventi": len(eventi[c]), "ultima_ms": ultima, "gruppo": gruppo})
+    peso_stato = {"confermato": 0, "sospetto": 1, "candidato": 2, "attivo": 3}
+    risultati.sort(key=lambda r: (peso_stato[r["stato"]], -r["n_partite"], -r["punteggio"]))
+    return risultati
 
 
 def fase1():
-    print("\n=== FASE 1: triangolazione dei cheater confermati ===\n")
-    chiave = chiave_henrik()
+    print("\n=== FASE 1: dai rimborsi ai cheater ===\n")
     api = _richiedi_riot()
     db = Database()
     sincronizza(db)
     righe = []
-    if chiave:
-        da_fare = [r[0] for r in db.esegui(
-            "SELECT g.puuid FROM giocatori g LEFT JOIN henrik_controllati h ON g.puuid=h.puuid "
-            "WHERE h.ts IS NULL OR h.ts < ?", (time.time() - 7 * 86400,))]
-        print(f"Controllo i rimborsi di {len(da_fare)} giocatori incontrati (Ctrl+C per fermarti, riprende da qui).")
-        try:
-            for i, u in enumerate(da_fare, 1):
-                storia, msg = henrik_storico_mmr(u, api.regione, chiave)
-                time.sleep(P["henrik_pausa_secondi"])
-                db.esegui("INSERT OR REPLACE INTO henrik_controllati VALUES(?,?,?)", (u, time.time(), msg))
-                for e in interpreta_rimborsi(storia or []):
-                    db.esegui("INSERT OR REPLACE INTO rimborsi VALUES(?,?,?,?,?,?)",
-                              (u, e["match_id"], e["data"], e["rr"], "henrik",
-                               json.dumps(partite_rimborsate(e))))
-                print(f"   [{i}/{len(da_fare)}] {msg}")
-        except KeyboardInterrupt:
-            print("\nInterrotto: proseguo con la triangolazione dei dati raccolti finora.")
-    else:
-        print("[i] Nessuna chiave Henrik: uso solo i dati ufficiali Riot (va bene cosi').")
     tutti = [r[0] for r in db.esegui("SELECT puuid FROM giocatori UNION SELECT puuid FROM henrik_controllati")]
-    print(f"Cerco rimborsi nei dati ufficiali Riot di {len(tutti)} giocatori (veloce, niente Henrik)...")
+    print(f"1) Cerco rimborsi nei dati ufficiali Riot di {len(tutti)} giocatori...")
     try:
         for i, u in enumerate(tutti, 1):
             registra_rimborsi_riot(db, u, api.aggiornamenti_competitivi(u, 20))
             if i % 10 == 0 or i == len(tutti):
                 print(f"   [{i}/{len(tutti)}]")
     except KeyboardInterrupt:
-        print("\nInterrotto.")
+        print("\nInterrotto: proseguo con i dati raccolti finora.")
     n_r = db.esegui("SELECT COUNT(*) FROM (SELECT DISTINCT puuid, match_id FROM rimborsi)")[0][0]
-    righe.append(f"Rimborsi nel database: {n_r}")
-    classifica = triangola(api, db)
-    righe.append("\nCandidati (punteggio = partite rimborsate in cui era avversario, pesate):")
-    for c, s, n in classifica[:25]:
-        stato = "CONFERMATO" if (n >= 2 and s >= 1.5) else ""
-        nome = (db.esegui("SELECT nome FROM giocatori WHERE puuid=?", (c,)) or [[None]])[0][0]
-        righe.append(f"  {c[:8]}  {nome or '(nome non salvato)':24s} punteggio {s:.2f}  partite {n}  {stato}")
-    if not classifica:
-        righe.append("  Nessuno: servono piu' rimborsi. Continua a giocare con Valocheck aperto e rilancia.")
+    righe.append(f"Rimborsi distinti nel database: {n_r}")
+    print("\n2) Incrocio gli avversari delle partite rimborsate e controllo chi ha smesso di giocare...")
+    ris = triangola(api, db)
+    conta = {}
+    for r in ris:
+        conta[r["stato"]] = conta.get(r["stato"], 0) + 1
+    righe.append("Riepilogo: " + (", ".join(f"{k} {v}" for k, v in conta.items()) or "nessun candidato"))
+    righe.append("")
+    for r in ris[:40]:
+        giorni = "" if not r["ultima_ms"] else f"ultima partita {(time.time() * 1000 - r['ultima_ms']) / 86400000:.0f} giorni fa"
+        gruppo = f"  in gruppo con: {', '.join(g[:8] for g in r['gruppo'])}" if r["gruppo"] else ""
+        righe.append(f"  {r['puuid'][:8]}  partite rimborsate {r['n_partite']}  punteggio {r['punteggio']:.2f}  "
+                     f"{giorni}{gruppo}")
+        righe.append(f"            -> {ETICHETTE_STATO[r['stato']]}")
+    if not ris:
+        righe.append("  Nessuno per ora: servono piu' rimborsi. Continua a giocare con Valocheck aperto.")
+    righe += ["",
+              "Come leggere:",
+              "  - CONFERMATO: avversario in 2+ partite rimborsate E fermo da prima del rimborso. E' l'indizio",
+              "    piu' forte che abbiamo, ma resta un'inferenza: Riot non dice chi ha bannato.",
+              "  - sospetto: una sola partita rimborsata + account fermo. Da solo NON basta (c'e' anche",
+              "    chi smette di giocare per conto suo): serve un secondo rimborso.",
+              "  - ancora attivo: gioca ancora, quindi non e' stato bannato. Probabile coincidenza",
+              "    o compagno di gruppo di chi barava.",
+              "  - 'in gruppo con': giocavano insieme; i rimborsi non dicono chi dei due barava."]
+    pv = db.esegui("SELECT match_id, perdenti_rimborsati, perdenti_dati, stato FROM partite_verificate "
+                   "WHERE stato IN ('certa','risolta','nessun_fermo')")
+    bn = db.esegui("SELECT puuid, match_id, perdenti_rimborsati, perdenti_dati, stato, ultima_partita_ms FROM bannati")
+    righe += ["", f"RACCOLTA AUTOMATICA (metodo 'tutta la squadra rimborsata'): {len(pv)} partite col cheater "
+                  f"individuate, {len(bn)} account fermi tra i vincitori"]
+    for u, mid, rb, dt, stb, ult in bn:
+        righe.append(f"  {u[:8]}  partita {mid[:8]}  avversari rimborsati {rb}/{dt}  "
+                     f"ultima partita {(time.time() * 1000 - (ult or 0)) / 86400000:.0f} giorni fa  -> "
+                     + ("PROBABILE BANNATO" if stb == "bannato" else "ambiguo (piu' vincitori fermi)"))
+    for mid, rb, dt, stp in pv:
+        if stp != "risolta":
+            righe.append(f"  partita {mid[:8]}  avversari rimborsati {rb}/{dt}  -> "
+                         + ("in attesa: nessun vincitore risulta ancora fermo" if stp == "certa"
+                            else "nessun vincitore si e' fermato (da capire)"))
+    # Le ultime partite di un account bannato sono partite giocate barando: le
+    # analizzo e le salvo, sono gli esempi che servono alla Fase 4.
+    da_analizzare = [r["puuid"] for r in ris if r["stato"] in ("confermato", "sospetto")][:15]
+    if da_analizzare:
+        print(f"\n3) Salvo le statistiche di {len(da_analizzare)} account fermi (esempi per la Fase 4)...")
+        an = Analizzatore(api, db)
+        for u in da_analizzare:
+            try:
+                db.vedi_giocatore(u, None)
+                an._analizza(u, None)
+            except Exception as e:  # noqa: BLE001
+                print(f"   {u[:8]}: non riuscito ({e})")
+    print()
     for r in righe:
         print(r)
     sincronizza(db)
     _salva_rapporto("fase1", righe)
     attendi_invio()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# RACCOLTA AUTOMATICA: dai rimborsi alla partita, dalla partita al bannato
+# ════════════════════════════════════════════════════════════════════════════
+# Riot rimborsa chi ha PERSO contro un cheater.  Quindi:
+#  1. leggo lo storico competitivo dei giocatori incontrati e cerco rimborsi;
+#  2. per ogni sconfitta recente di chi e' stato rimborsato, guardo gli altri 4
+#     della sua squadra: se anche loro hanno un rimborso dopo quella partita,
+#     QUELLA e' la partita col cheater (non serve piu' indovinare quale);
+#  3. il cheater e' uno dei 5 vincitori: quello che da allora non gioca piu'.
+# Resta un'inferenza (Riot non dice chi ha bannato), ma molto piu' stretta
+# dell'incrocio tra vittime che non si conoscono.
+
+STATO_RACCOLTA = {"testo": "ferma"}
+
+
+def verifica_partita(api, db: "Database", mid: str, vittima: str) -> Optional[str]:
+    """Controlla se i compagni di squadra della vittima sono stati rimborsati dopo la partita mid."""
+    if db.esegui("SELECT 1 FROM partite_verificate WHERE match_id=?", (mid,)):
+        return None
+    cfg = P["raccolta"]
+    p = estrai_partita(api.dettagli_partita(mid))
+    if not p or vittima not in p["squadra"]:
+        return None
+    db.salva_squadre(p)
+    if p["vinto"].get(vittima):
+        return None
+    t0 = p["inizio_ms"] or 0
+    perdenti = [u for u, t in p["squadra"].items() if t == p["squadra"][vittima]]
+    dati = rimb = 0
+    tempi = []
+    for u in perdenti:
+        comp = api.aggiornamenti_competitivi(u, 20)
+        if comp is None:
+            continue
+        eventi = registra_rimborsi_riot(db, u, comp)
+        partite = [x for x in comp.get("Matches") or [] if x.get("TierBeforeUpdate") or x.get("TierAfterUpdate")]
+        if mid not in [x.get("MatchID") for x in partite]:
+            continue                      # il suo storico non arriva fino a quella partita
+        if not any((x.get("MatchStartTime") or 0) > t0 for x in partite):
+            continue                      # non ha piu' giocato: un eventuale rimborso non si vede ancora
+        dati += 1
+        suoi = [e["ora"] or 0 for e in eventi if e["rimborso"] > 0 and (e["ora"] or 0) > t0
+                and any(c[0] == mid for c in e["candidate"])]
+        if suoi:
+            rimb += 1
+            tempi.append(min(suoi))
+    if rimb >= cfg["perdenti_minimi"] and rimb >= cfg["quota_perdenti"] * dati:
+        stato = "certa"
+    elif dati >= cfg["perdenti_minimi"]:
+        stato = "no"
+    else:
+        stato = "pochi_dati"
+    db.esegui("INSERT OR REPLACE INTO partite_verificate VALUES(?,?,?,?,?,?,?,?)",
+              (mid, time.time(), t0, min(tempi) if tempi else 0, dati, rimb, stato, p["squadra"][vittima]))
+    return stato
+
+
+def risolvi_partita(api, db: "Database", mid: str) -> Optional[List[str]]:
+    """Per una partita 'certa': chi dei vincitori ha smesso di giocare prima del rimborso?"""
+    r = db.esegui("SELECT t_rimborso_ms, perdenti_dati, perdenti_rimborsati, squadra_persa "
+                  "FROM partite_verificate WHERE match_id=? AND stato='certa'", (mid,))
+    if not r:
+        return None
+    t_rimb, dati, rimb, persa = r[0]
+    ora = time.time() * 1000
+    G = 86400000
+    giorni_fermo = P["fase1"]["giorni_fermo"]
+    vincitori = [u for u, t in db.squadre_di(mid).items() if t != persa]
+    fermi, letti = [], 0
+    for u in vincitori:
+        st = api.storico_partite(u, 3)
+        if st is None:
+            continue
+        letti += 1
+        tempi = [h.get("GameStartTime", 0) for h in (st.get("History") or [])]
+        ultima = max(tempi) if tempi else 0
+        db.esegui("INSERT OR REPLACE INTO controlli_attivita VALUES(?,?,?,?)",
+                  (u, time.time(), ultima, "fermo" if ultima <= t_rimb else "attivo"))
+        if ultima <= t_rimb and ora - ultima >= giorni_fermo * G:
+            fermi.append((u, ultima))
+    if letti < len(vincitori) or (not fermi and ora - t_rimb < P["raccolta"]["giorni_attesa_ban"] * G):
+        # troppo presto o dati incompleti: riprovo piu' avanti
+        db.esegui("UPDATE partite_verificate SET ts=? WHERE match_id=?", (time.time(), mid))
+        return None
+    gruppi = {x[0] for x in db.esegui("SELECT party FROM squadre WHERE match_id=? AND puuid IN (%s)"
+                                      % ",".join("?" * len(fermi)), (mid, *[u for u, _ in fermi]))} if fermi else set()
+    stato = "bannato" if len(fermi) == 1 or (fermi and len(gruppi) == 1 and "" not in gruppi) else "ambiguo"
+    for u, ultima in fermi:
+        db.esegui("INSERT OR REPLACE INTO bannati VALUES(?,?,?,?,?,?,?,?,?)",
+                  (u, mid, ultima, t_rimb, rimb, dati, len(fermi), stato, time.time()))
+    db.esegui("UPDATE partite_verificate SET stato=?, ts=? WHERE match_id=?",
+              ("risolta" if fermi else "nessun_fermo", time.time(), mid))
+    return [u for u, _ in fermi]
+
+
+class Raccoglitore:
+    """Lavora in sottofondo, piano, mentre Valocheck e' aperto."""
+
+    def __init__(self, api, db: "Database", monitor=None, analizzatore=None, stampa=print):
+        self.api, self.db, self.mon, self.an, self.stampa = api, db, monitor, analizzatore, stampa
+        self.richieste = 0
+        self.giorno = ""
+        self.errori = 0
+
+    # --- chiamate lente e contate -----------------------------------------
+    def _conta_giorno(self):
+        oggi = datetime.now().strftime("%Y-%m-%d")
+        if oggi != self.giorno:
+            r = self.db.esegui("SELECT valore FROM stato WHERE chiave=?", ("richieste_" + oggi,))
+            self.giorno, self.richieste = oggi, int(r[0][0]) if r else 0
+
+    def _conta(self):
+        self._conta_giorno()
+        self.richieste += 1
+        if self.richieste % 10 == 0:
+            self.db.esegui("INSERT OR REPLACE INTO stato VALUES(?,?)",
+                           ("richieste_" + self.giorno, str(self.richieste)))
+        time.sleep(P["raccolta"]["pausa_secondi"])
+
+    def aggiornamenti_competitivi(self, u, n=20):
+        self._conta()
+        return self.api.aggiornamenti_competitivi(u, n)
+
+    def storico_partite(self, u, n=20, coda=None):
+        self._conta()
+        return self.api.storico_partite(u, n, coda)
+
+    def dettagli_partita(self, mid):
+        if not os.path.exists(os.path.join(CACHE_PARTITE, f"{mid}.json.gz")):
+            self._conta()
+        return self.api.dettagli_partita(mid)
+
+    # --- ciclo --------------------------------------------------------------
+    def occupato(self) -> bool:
+        if self.mon is None:
+            return False
+        if not self.mon.connesso or self.mon.stato in ("PREGAME", "DISCONNESSO", "CONNESSIONE"):
+            return True
+        if self.an is not None:
+            with self.an.lock:
+                return any(r.get("stato") in ("in coda", "in analisi") for r in self.an.risultati.values())
+        return False
+
+    def ciclo(self):
+        time.sleep(20)
+        while True:
+            try:
+                if self.occupato():
+                    time.sleep(5)
+                    continue
+                self._conta_giorno()
+                if self.richieste >= P["raccolta"]["max_richieste_giorno"]:
+                    self._testo("limite di richieste di oggi raggiunto")
+                    time.sleep(120)
+                    continue
+                if not self.passo():
+                    self._testo("in pari: nessun giocatore nuovo da leggere")
+                    time.sleep(60)
+            except Exception as e:  # noqa: BLE001
+                self.errori += 1
+                STATO_RACCOLTA["testo"] = f"errore temporaneo ({e})"
+                time.sleep(30)
+
+    def _testo(self, extra=""):
+        q = lambda s: self.db.esegui(s)[0][0]
+        STATO_RACCOLTA["testo"] = (
+            f"{q('SELECT COUNT(*) FROM raccolta')} giocatori letti, "
+            f"{q('SELECT COUNT(*) FROM (SELECT DISTINCT puuid, match_id FROM rimborsi)')} rimborsi, "
+            f"{q('''SELECT COUNT(*) FROM partite_verificate WHERE stato IN ('certa','risolta','nessun_fermo')''')} partite col cheater individuate, "
+            f"{q('''SELECT COUNT(*) FROM bannati WHERE stato='bannato' ''')} probabili bannati"
+            + (f" ({extra})" if extra else ""))
+
+    def passo(self) -> bool:
+        """Un'unita' di lavoro. False se non c'e' niente da fare."""
+        cfg = P["raccolta"]
+        ora = time.time()
+        self.db.esegui("DELETE FROM partite_verificate WHERE stato='pochi_dati' AND ts<?", (ora - 3 * 86400,))
+        # 1) partite certe ancora da risolvere (riprovo una volta al giorno)
+        r = self.db.esegui("SELECT match_id FROM partite_verificate WHERE stato='certa' AND ts<? LIMIT 1",
+                           (ora - 86400,))
+        if not r:
+            r = self.db.esegui("SELECT match_id FROM partite_verificate WHERE stato='certa' AND match_id NOT IN "
+                               "(SELECT valore FROM stato WHERE chiave LIKE 'tentata_%') LIMIT 1")
+        if r:
+            mid = r[0][0]
+            self.db.esegui("INSERT OR REPLACE INTO stato VALUES(?,?)", ("tentata_" + mid, mid))
+            fermi = risolvi_partita(self, self.db, mid)
+            for u in fermi or []:
+                self.stampa(f"[raccolta] probabile bannato individuato: {u[:8]} (partita {mid[:8]})")
+                if self.an is not None:
+                    try:
+                        self.db.vedi_giocatore(u, None)
+                        self.an._analizza(u, None)       # le sue ultime partite: esempi per la Fase 4
+                    except Exception:  # noqa: BLE001
+                        pass
+            self._testo()
+            return True
+        # 2) prossimo giocatore: prima quelli delle tue lobby, poi chi compare nelle partite lette
+        vecchio = ora - cfg["giorni_rilettura"] * 86400
+        r = self.db.esegui("SELECT g.puuid FROM giocatori g LEFT JOIN raccolta r ON r.puuid=g.puuid "
+                           "WHERE r.puuid IS NULL OR r.ts<? ORDER BY (r.ts IS NOT NULL), g.ultima_vista DESC LIMIT 1",
+                           (vecchio,))
+        if not r and cfg["allarga"]:
+            r = self.db.esegui("SELECT s.puuid FROM squadre s LEFT JOIN raccolta r ON r.puuid=s.puuid "
+                               "WHERE r.puuid IS NULL LIMIT 1")
+        if not r:
+            return False
+        u = r[0][0]
+        comp = self.aggiornamenti_competitivi(u, 20)
+        if comp is None:
+            self.db.esegui("INSERT OR REPLACE INTO raccolta VALUES(?,?,?)", (u, ora, "errore"))
+            return True
+        eventi = registra_rimborsi_riot(self.db, u, comp)
+        n = 0
+        for e in eventi:
+            if e["rimborso"] <= 0:
+                continue
+            n += 1
+            for mid, _ in e["candidate"]:
+                if verifica_partita(self, self.db, mid, u) == "certa":
+                    self.stampa(f"[raccolta] partita col cheater individuata: {mid[:8]}")
+        self.db.esegui("INSERT OR REPLACE INTO raccolta VALUES(?,?,?)", (u, ora, f"rimborsi:{n}"))
+        self._testo()
+        return True
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -2023,24 +2784,30 @@ def esporta():
     righe = db.esegui("SELECT o.puuid, o.ts, o.prob, o.llr_prestazioni, o.llr_account, o.n_partite, o.dettagli "
                       "FROM osservazioni o JOIN (SELECT puuid, MAX(ts) m FROM osservazioni GROUP BY puuid) u "
                       "ON o.puuid=u.puuid AND o.ts=u.m")
-    conf = {r[0] for r in db.esegui("SELECT puuid FROM confermati")}
+    conf = {r[0]: r[1] for r in db.esegui("SELECT puuid, stato FROM candidati")}
+    bann = {r[0]: r[1] for r in db.esegui("SELECT puuid, stato FROM bannati")}
     att = {r[0]: r[1] for r in db.esegui(
         "SELECT puuid, esito FROM controlli_attivita c WHERE ts=(SELECT MAX(ts) FROM controlli_attivita d WHERE d.puuid=c.puuid)")}
     chiavi_s = list(P["segnali"].keys())
-    chiavi_p = ["livello", "stagioni", "partite_atto", "winrate", "rr_medio", "salto_tier", "pausa_giorni", "tier", "tier_max"]
+    chiavi_p = ["livello", "stagioni", "partite_atto", "winrate", "rr_medio", "salto_tier", "pausa_giorni",
+                "tier", "tier_max", "atto_peak", "atti_giocati", "atti_fermo", "pausa_atti_recente", "pausa_atti_max"]
     with open(f, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh, delimiter=";")
         w.writerow(["puuid", "data", "prob", "llr_prestazioni", "llr_account", "n_partite"]
                    + [f"z_{s}" for s in chiavi_s] + chiavi_p
-                   + ["etichetta_fase1_confermato", "esito_fase2"])
+                   + [f"prova_{s}" for s in SEGNALI_PROVA] + ["agenti"]
+                   + ["stato_fase1", "esito_fase2", "stato_raccolta"])
         for puuid, ts, prob, lp, la, n, det in righe:
             d = json.loads(det or "{}")
             contr = {c["chiave"]: c.get("z_medio", "") for c in d.get("analisi", {}).get("contributi", [])}
             prof = d.get("profilo", {})
+            prova = {c["chiave"]: c.get("z_medio", "") for c in d.get("analisi", {}).get("prova", [])}
             w.writerow([puuid, datetime.fromtimestamp(ts).isoformat(timespec="minutes"),
                         f"{prob:.4f}", lp, la, n] + [contr.get(s, "") for s in chiavi_s]
                        + [prof.get(k, "") for k in chiavi_p]
-                       + [1 if puuid in conf else "", att.get(puuid, "")])
+                       + [prova.get(k, "") for k in SEGNALI_PROVA]
+                       + [",".join(d.get("analisi", {}).get("agenti", []))]
+                       + [conf.get(puuid, ""), att.get(puuid, ""), bann.get(puuid, "")])
     print(f"Esportati {len(righe)} giocatori in:\n{f}")
     attendi_invio()
 
@@ -2250,7 +3017,12 @@ class FintaAPI:
     def mmr(self, u):
         pr = self.profili[u]
         atto = contenuti.atto_corrente or "atto-demo"
-        stag = {f"vecchio-{i}": {"NumberOfGames": 20, "NumberOfWins": 10, "CompetitiveTier": 15}
+        passati = [a[0] for a in contenuti.atti_ordinati if a[0] != atto][::-1]   # dal piu' recente
+        if u == "demo-closet":
+            passati = passati[4:]            # 4 atti di pausa prima di tornare
+        stag = {(passati[i] if i < len(passati) else f"vecchio-{i}"):
+                {"NumberOfGames": 20, "NumberOfWins": 10, "CompetitiveTier": 15,
+                 "WinsByTier": {"19": 3} if i == 2 else {}}
                 for i in range(pr["atti"] - 1)}
         stag[atto] = {"NumberOfGames": pr["partite"], "NumberOfWins": round(pr["partite"] * pr["wr"]),
                       "CompetitiveTier": 18, "RankedRating": 40}
@@ -2310,6 +3082,135 @@ def esegui_test() -> bool:
     storia[-1]["refunded_rr"] = 35        # = 16 + 19 ? no: -19 -16 -> 35
     ev = interpreta_rimborsi(storia)
     verifica(ev and ["m2", "m4"] in ev[0]["combinazioni_B"], "Fase 1: il rimborso di 35 RR viene ricondotto a 16+19")
+    # --- storia degli atti: peak, vecchia numerazione dei gradi, pause ---
+    salvati = (contenuti.atti_ordinati, contenuti.atto_corrente)
+    contenuti.atti_ordinati = [["a1", "E4A3", "2022-04-27T00:00:00Z"], ["a2", "E5A1", "2022-06-22T00:00:00Z"],
+                               ["a3", "E5A2", "2022-08-23T00:00:00Z"], ["a4", "E5A3", "2022-10-18T00:00:00Z"],
+                               ["a5", "E6A1", "2023-01-10T00:00:00Z"], ["a6", "E6A2", "2023-03-07T00:00:00Z"]]
+    contenuti.atto_corrente = "a6"
+    st = storia_atti({"a1": {"NumberOfGames": 30, "CompetitiveTier": 21},      # Immortal 1 vecchio stile
+                      "a2": {"NumberOfGames": 12, "CompetitiveTier": 20, "WinsByTier": {"22": 2}},
+                      "a6": {"NumberOfGames": 9, "CompetitiveTier": 19}})
+    verifica(st["tier_max"] == 24 and st["atto_peak"] == "E4A3",
+             "peak: un Immortal 1 di prima dell'Episodio 5 viene letto come Immortal 1, non Ascendant 1")
+    verifica(st["pausa_atti_recente"] == 3 and st["atti_fermo"] == 0 and "dopo 3 atti" in st["pause_testo"],
+             "pause: riconosce il ritorno dopo 3 atti saltati")
+    st2 = storia_atti({"a2": {"NumberOfGames": 5, "CompetitiveTier": 12}, "a3": {"NumberOfGames": 5}})
+    verifica(st2["atti_fermo"] == 3 and "non gioca competitive da 3 atti" in st2["pause_testo"],
+             "pause: riconosce chi non gioca competitive da 3 atti")
+    contenuti.atti_ordinati, contenuti.atto_corrente = salvati
+
+    # --- Fase 1: rimborsi senza somma esatta, account fermo, compagno di gruppo ---
+    G = 86400000
+    ora = time.time() * 1000
+
+    def partita_finta(mid, blu, rossi, party=None):
+        return {"match_id": mid, "squadra": {**{u: "Blue" for u in blu}, **{u: "Red" for u in rossi}},
+                "party": party or {}}
+
+    class ApiFase1:
+        ultime = {"cheater": ora - 20 * G, "duo": ora - 1 * G, "onesto": ora - 2 * G, "ritirato": ora - 19 * G}
+
+        def storico_partite(self, u, n=3, coda=None):
+            return {"History": [{"GameStartTime": self.ultime.get(u, ora - G)}]}
+
+        def dettagli_partita(self, mid):
+            return None
+
+    dbt = Database(":memory:")
+    gruppo = {"cheater": "p1", "duo": "p1"}
+    dbt.salva_squadre(partita_finta("m1", ["A", "a2"], ["cheater", "duo", "onesto", "x1", "x2"], gruppo))
+    dbt.salva_squadre(partita_finta("m2", ["B", "b2"], ["cheater", "duo", "y1", "y2", "y3"], gruppo))
+    dbt.salva_squadre(partita_finta("m3", ["A", "a3"], ["ritirato", "z1", "z2", "z3", "z4"]))
+    comp_a = {"Matches": [
+        {"MatchID": "m3", "MatchStartTime": ora - 21 * G, "TierBeforeUpdate": 15, "TierAfterUpdate": 15,
+         "RankedRatingBeforeUpdate": 60, "RankedRatingAfterUpdate": 41, "RankedRatingEarned": -19},
+        {"MatchID": "m1", "MatchStartTime": ora - 20.5 * G, "TierBeforeUpdate": 15, "TierAfterUpdate": 15,
+         "RankedRatingBeforeUpdate": 41, "RankedRatingAfterUpdate": 20, "RankedRatingEarned": -21},
+        {"MatchID": "dopoA", "MatchStartTime": ora - 18 * G, "TierBeforeUpdate": 15, "TierAfterUpdate": 15,
+         "RankedRatingBeforeUpdate": 20, "RankedRatingAfterUpdate": 49, "RankedRatingEarned": 18,
+         "RankedRatingRefundApplied": 11}]}                     # 11 non e' la somma di niente
+    comp_b = {"Matches": [
+        {"MatchID": "m2", "MatchStartTime": ora - 20.2 * G, "TierBeforeUpdate": 15, "TierAfterUpdate": 15,
+         "RankedRatingBeforeUpdate": 50, "RankedRatingAfterUpdate": 33, "RankedRatingEarned": -17},
+        {"MatchID": "dopoB", "MatchStartTime": ora - 17 * G, "TierBeforeUpdate": 15, "TierAfterUpdate": 15,
+         "RankedRatingBeforeUpdate": 33, "RankedRatingAfterUpdate": 28, "RankedRatingEarned": -18,
+         "RankedRatingRefundApplied": 13}]}
+    registra_rimborsi_riot(dbt, "A", comp_a)
+    registra_rimborsi_riot(dbt, "B", comp_b)
+    esito = {r["puuid"]: r for r in triangola(ApiFase1(), dbt, stampa=None)}
+    verifica(esito.get("cheater", {}).get("stato") == "confermato",
+             "Fase 1: il cheater (2 partite rimborsate + account fermo) risulta confermato, anche senza somma esatta")
+    verifica(esito.get("duo", {}).get("stato") == "attivo" and "cheater" in esito["duo"]["gruppo"],
+             "Fase 1: il compagno di gruppo che gioca ancora NON viene confermato ed e' segnalato come in gruppo")
+    verifica(esito.get("ritirato", {}).get("stato") == "sospetto" and "onesto" not in esito,
+             "Fase 1: chi ha solo smesso di giocare resta 'sospetto'; chi gioca ancora (1 partita) non compare")
+
+    # --- raccolta automatica: tutta la squadra rimborsata -> partita certa -> vincitore fermo ---
+    def agg(mid, t, rr, rimb=0):
+        d = {"MatchID": mid, "MatchStartTime": t, "TierBeforeUpdate": 15, "TierAfterUpdate": 15,
+             "RankedRatingBeforeUpdate": 50, "RankedRatingAfterUpdate": 50 + rr + rimb, "RankedRatingEarned": rr}
+        if rimb:
+            d["RankedRatingRefundApplied"] = rimb
+        return d
+
+    perdenti = ["v1", "v2", "v3", "v4", "v5"]
+    vincitori = ["ban", "w2", "w3", "w4", "w5"]
+
+    class ApiRaccolta:
+        def dettagli_partita(self, mid):
+            sq = {"X": (perdenti, vincitori), "Y": (perdenti, ["q1", "q2", "q3", "q4", "q5"])}[mid]
+            return {"matchInfo": {"matchId": mid, "gameStartMillis": ora - (30 if mid == "X" else 31) * G},
+                    "players": [{"subject": u, "teamId": "Red"} for u in sq[0]]
+                    + [{"subject": u, "teamId": "Blue"} for u in sq[1]],
+                    "teams": [{"teamId": "Red", "won": False}, {"teamId": "Blue", "won": True}], "roundResults": []}
+
+        def aggiornamenti_competitivi(self, u, n=20):
+            if u == "v5":                                   # non ha piu' giocato: nessun dato
+                return {"Matches": [agg("X", ora - 30 * G, -20)]}
+            if u == "v4":                                   # ha rigiocato ma senza rimborso
+                return {"Matches": [agg("X", ora - 30 * G, -20), agg("d4", ora - 25 * G, 15)]}
+            if u == "v1":                                   # aveva perso anche la partita Y, da solo
+                return {"Matches": [agg("Y", ora - 31 * G, -18), agg("X", ora - 30 * G, -20),
+                                    agg("d1", ora - 24 * G, 17, 20)]}
+            return {"Matches": [agg("X", ora - 30 * G, -20), agg("d" + u, ora - 24 * G, 17, 20)]}
+
+        def storico_partite(self, u, n=3, coda=None):
+            return {"History": [{"GameStartTime": ora - (28 if u == "ban" else 1) * G}]}
+
+    dbr = Database(":memory:")
+    ar = ApiRaccolta()
+    ev1 = registra_rimborsi_riot(dbr, "v1", ar.aggiornamenti_competitivi("v1"))
+    cand = [c[0] for e in ev1 for c in e["candidate"]]
+    stati = {m: verifica_partita(ar, dbr, m, "v1") for m in cand}
+    verifica(stati.get("X") == "certa" and stati.get("Y") != "certa",
+             "Raccolta: la partita dove 3 perdenti su 4 sono rimborsati e' riconosciuta; l'altra sconfitta no")
+    fermi = risolvi_partita(ar, dbr, "X")
+    verifica(fermi == ["ban"] and dbr.esegui("SELECT stato FROM bannati WHERE puuid='ban'")[0][0] == "bannato"
+             and "rimborsati" in dbr.segnalazione("ban"),
+             "Raccolta: tra i 5 vincitori viene indicato solo quello che ha smesso di giocare")
+
+    # --- segnali in prova: chi guarda sempre i nemici ha lo 'sguardo' piu' basso ---
+    rng = random.Random(3)
+    blu, rossi = [f"b{i}" for i in range(5)], [f"r{i}" for i in range(5)]
+    kills = []
+    for i in range(40):
+        pos = {u: (rng.uniform(-3000, 3000), rng.uniform(-3000, 3000)) for u in blu + rossi}
+        locs = []
+        for u in blu + rossi:
+            nem = rossi if u in blu else blu
+            if u == "b0":
+                e = pos[nem[i % 5]]
+                vista = math.atan2(e[1] - pos[u][1], e[0] - pos[u][0])
+            else:
+                vista = rng.uniform(-math.pi, math.pi)
+            locs.append({"subject": u, "viewRadians": vista, "location": {"x": pos[u][0], "y": pos[u][1]}})
+        kills.append({"killer": "zz", "victim": "yy", "roundTime": i, "playerLocations": locs})
+    md = {"players": [{"subject": u, "teamId": "Blue"} for u in blu] + [{"subject": u, "teamId": "Red"} for u in rossi],
+          "roundResults": [{"roundNum": 0, "winningTeam": "Blue", "playerStats": [{"subject": "b1", "kills": kills}]}]}
+    zp = z_prova(segnali_sperimentali(md, {"convenzione": 0, "scarto": 0.0, "affidabile": True}), "b0")
+    verifica(zp.get("sguardo", (0,))[0] > 2, "Segnali in prova: chi guarda sempre verso un nemico spicca nello 'sguardo'")
+
     print("\nRISULTATO:", "tutte le verifiche superate" if ok else "ALCUNE VERIFICHE FALLITE")
     return ok
 
@@ -2337,6 +3238,8 @@ def avvia_dal_vivo(demo: bool = False):
                 sincronizza(db)
                 time.sleep(300)
         threading.Thread(target=ciclo_condivisione, daemon=True).start()
+        if P["raccolta"]["attiva"]:
+            threading.Thread(target=Raccoglitore(api, db, mon, an).ciclo, daemon=True).start()
     print(f"\nPagina dei risultati: {url}")
     print("Si apre da sola nel browser. Lascia aperta QUESTA finestra mentre giochi.")
     print("Per chiudere Valocheck: chiudi questa finestra (o premi Ctrl+C).\n")
